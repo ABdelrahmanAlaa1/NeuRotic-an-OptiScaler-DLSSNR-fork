@@ -588,33 +588,33 @@ static uint32_t GetPresetIndex(IFeature* feature, bool dlssd = false)
 
             if (ratio <= (Config::Instance()->QualityRatio_UltraPerformance.value_or_default() + 0.01f))
             {
-                return Config::Instance()->RenderPresetForAll.value_or(
-                    Config::Instance()->RenderPresetUltraPerformance.value_or_default());
+                return Config::Instance()->RenderPresetUltraPerformance.value_or(
+                    Config::Instance()->RenderPresetForAll.value_or(State::Instance().dlssRenderPresetUltraPerformance));
             }
             else if (ratio <= (Config::Instance()->QualityRatio_Performance.value_or_default() + 0.01f))
             {
-                return Config::Instance()->RenderPresetForAll.value_or(
-                    Config::Instance()->RenderPresetPerformance.value_or_default());
+                return Config::Instance()->RenderPresetPerformance.value_or(
+                    Config::Instance()->RenderPresetForAll.value_or(State::Instance().dlssRenderPresetPerformance));
             }
             else if (ratio <= (Config::Instance()->QualityRatio_Balanced.value_or_default() + 0.01f))
             {
-                return Config::Instance()->RenderPresetForAll.value_or(
-                    Config::Instance()->RenderPresetBalanced.value_or_default());
+                return Config::Instance()->RenderPresetBalanced.value_or(
+                    Config::Instance()->RenderPresetForAll.value_or(State::Instance().dlssRenderPresetBalanced));
             }
             else if (ratio <= (Config::Instance()->QualityRatio_Quality.value_or_default() + 0.01f))
             {
-                return Config::Instance()->RenderPresetForAll.value_or(
-                    Config::Instance()->RenderPresetQuality.value_or_default());
+                return Config::Instance()->RenderPresetQuality.value_or(
+                    Config::Instance()->RenderPresetForAll.value_or(State::Instance().dlssRenderPresetQuality));
             }
             else if (ratio <= (Config::Instance()->QualityRatio_UltraQuality.value_or_default() + 0.01f))
             {
-                return Config::Instance()->RenderPresetForAll.value_or(
-                    Config::Instance()->RenderPresetUltraQuality.value_or_default());
+                return Config::Instance()->RenderPresetUltraQuality.value_or(
+                    Config::Instance()->RenderPresetForAll.value_or(State::Instance().dlssRenderPresetUltraQuality));
             }
             else
             {
-                return Config::Instance()->RenderPresetForAll.value_or(
-                    Config::Instance()->RenderPresetDLAA.value_or_default());
+                return Config::Instance()->RenderPresetDLAA.value_or(
+                    Config::Instance()->RenderPresetForAll.value_or(State::Instance().dlssRenderPresetDLAA));
             }
         }
         else if (State::Instance().dlssPresetsOverriddenExternally)
@@ -728,8 +728,8 @@ template <HasDefaultValue B> void MenuCommon::AddDLSSRenderPreset(std::string na
 {
     // clang-format off
     static const std::vector<MenuOption<uint32_t>> presets = {
-        { NVSDK_NGX_DLSS_Hint_Render_Preset_Default, "DEFAULT", 
-            "Whatever the game uses" },
+        { NVSDK_NGX_DLSS_Hint_Render_Preset_Default, "NVIDIA DEFAULT",
+            "Use the NVIDIA/game default preset" },
         { NVSDK_NGX_DLSS_Hint_Render_Preset_A, "PRESET A",
             "Intended for Performance/Balanced/Quality modes.\nAn older variant best suited to combat ghosting...\nRemoved on recent versions!" },
         { NVSDK_NGX_DLSS_Hint_Render_Preset_B, "PRESET B",
@@ -764,6 +764,57 @@ template <HasDefaultValue B> void MenuCommon::AddDLSSRenderPreset(std::string na
             "Latest supported by the dll" }
     };
     // clang-format on
+
+    if constexpr (B == SoftDefault)
+    {
+        std::string preview = "USE GLOBAL";
+
+        if (value->has_value())
+        {
+            preview = "Unknown";
+            for (const auto& opt : presets)
+            {
+                if (opt.value == value->value())
+                {
+                    preview = opt.label;
+                    break;
+                }
+            }
+        }
+
+        if (ImGui::BeginCombo(name.c_str(), preview.c_str()))
+        {
+            const bool useGlobalSelected = !value->has_value();
+            if (ImGui::Selectable("USE GLOBAL", useGlobalSelected))
+                *value = std::optional<uint32_t> {};
+
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Inherit the global DLSS preset override");
+
+            for (const auto& opt : presets)
+            {
+                if (opt.hidden)
+                    continue;
+
+                if (opt.disabled)
+                    ImGui::BeginDisabled();
+
+                const bool isSelected = value->has_value() && value->value() == opt.value;
+                if (ImGui::Selectable(opt.label.c_str(), isSelected))
+                    *value = opt.value;
+
+                if (!opt.tooltip.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("%s", opt.tooltip.c_str());
+
+                if (opt.disabled)
+                    ImGui::EndDisabled();
+            }
+
+            ImGui::EndCombo();
+        }
+
+        return;
+    }
 
     PopulateCombo(name, *value, presets);
 }

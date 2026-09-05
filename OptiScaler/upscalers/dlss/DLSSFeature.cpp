@@ -159,18 +159,18 @@ void DLSSFeature::ProcessInitParams(NVSDK_NGX_Parameter* InParameters)
             LOG_DEBUG("RenderPresetUltraPerformance: {}",
                       Config::Instance()->RenderPresetUltraPerformance.value_or_default());
 
-            RenderPresetDLAA = Config::Instance()->RenderPresetForAll.value_or(
-                Config::Instance()->RenderPresetDLAA.value_or(RenderPresetDLAA));
-            RenderPresetUltraQuality = Config::Instance()->RenderPresetForAll.value_or(
-                Config::Instance()->RenderPresetUltraQuality.value_or(RenderPresetUltraQuality));
-            RenderPresetQuality = Config::Instance()->RenderPresetForAll.value_or(
-                Config::Instance()->RenderPresetQuality.value_or(RenderPresetQuality));
-            RenderPresetBalanced = Config::Instance()->RenderPresetForAll.value_or(
-                Config::Instance()->RenderPresetBalanced.value_or(RenderPresetBalanced));
-            RenderPresetPerformance = Config::Instance()->RenderPresetForAll.value_or(
-                Config::Instance()->RenderPresetPerformance.value_or(RenderPresetPerformance));
-            RenderPresetUltraPerformance = Config::Instance()->RenderPresetForAll.value_or(
-                Config::Instance()->RenderPresetUltraPerformance.value_or(RenderPresetUltraPerformance));
+            RenderPresetDLAA = Config::Instance()->RenderPresetDLAA.value_or(
+                Config::Instance()->RenderPresetForAll.value_or(RenderPresetDLAA));
+            RenderPresetUltraQuality = Config::Instance()->RenderPresetUltraQuality.value_or(
+                Config::Instance()->RenderPresetForAll.value_or(RenderPresetUltraQuality));
+            RenderPresetQuality = Config::Instance()->RenderPresetQuality.value_or(
+                Config::Instance()->RenderPresetForAll.value_or(RenderPresetQuality));
+            RenderPresetBalanced = Config::Instance()->RenderPresetBalanced.value_or(
+                Config::Instance()->RenderPresetForAll.value_or(RenderPresetBalanced));
+            RenderPresetPerformance = Config::Instance()->RenderPresetPerformance.value_or(
+                Config::Instance()->RenderPresetForAll.value_or(RenderPresetPerformance));
+            RenderPresetUltraPerformance = Config::Instance()->RenderPresetUltraPerformance.value_or(
+                Config::Instance()->RenderPresetForAll.value_or(RenderPresetUltraPerformance));
 
             LOG_DEBUG("Preset override active, config overrides:");
             LOG_DEBUG("Preset_DLAA {}", RenderPresetDLAA);

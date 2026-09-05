@@ -506,12 +506,12 @@ class Config
     CustomOptional<bool> DLSSEnabled { true };
     CustomOptional<bool> RenderPresetOverride { false };
     CustomOptional<uint32_t> RenderPresetForAll { 0 };
-    CustomOptional<uint32_t> RenderPresetDLAA { 0 };
-    CustomOptional<uint32_t> RenderPresetUltraQuality { 0 };
-    CustomOptional<uint32_t> RenderPresetQuality { 0 };
-    CustomOptional<uint32_t> RenderPresetBalanced { 0 };
-    CustomOptional<uint32_t> RenderPresetPerformance { 0 };
-    CustomOptional<uint32_t> RenderPresetUltraPerformance { 0 };
+    CustomOptional<uint32_t, SoftDefault> RenderPresetDLAA { 0 };
+    CustomOptional<uint32_t, SoftDefault> RenderPresetUltraQuality { 0 };
+    CustomOptional<uint32_t, SoftDefault> RenderPresetQuality { 0 };
+    CustomOptional<uint32_t, SoftDefault> RenderPresetBalanced { 0 };
+    CustomOptional<uint32_t, SoftDefault> RenderPresetPerformance { 0 };
+    CustomOptional<uint32_t, SoftDefault> RenderPresetUltraPerformance { 0 };
 
     // DLSSD
     CustomOptional<bool> DLSSDRenderPresetOverride { false };
