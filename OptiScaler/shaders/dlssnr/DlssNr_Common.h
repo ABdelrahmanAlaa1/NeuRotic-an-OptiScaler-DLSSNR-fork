@@ -62,6 +62,11 @@ struct DlssNrFrameInfo
     float MvScaleX = 1.0f;
     float MvScaleY = 1.0f;
 
+    // Projection jitter in render-pixel units, exactly as supplied by the game's NGX evaluate.
+    // Feature 18 is temporal but the reverse-engineered forwarder did not receive this metadata.
+    float JitterX = 0.0f;
+    float JitterY = 0.0f;
+
     // Throw away the model's history. Set it on a cut, a teleport, or the first frame of a feature.
     bool Reset = false;
 

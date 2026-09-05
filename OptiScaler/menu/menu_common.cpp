@@ -1,4 +1,4 @@
-﻿#include "pch.h"
+#include "pch.h"
 #include "menu_common.h"
 #include <dlssnr/DlssNr_ExposureScan.h>
 

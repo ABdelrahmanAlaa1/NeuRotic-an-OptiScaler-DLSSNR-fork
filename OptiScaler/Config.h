@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "SysUtils.h"
 #include "State.h"
@@ -257,6 +257,8 @@ class Config
     // DLSS Neural Rendering: a detail-synthesis pass over the upscaler's output. Off by default -- it is
     // an undocumented feature driven directly through its snippet, not something NVIDIA exposes.
     CustomOptional<bool> DlssNrEnabled { false };
+    CustomOptional<bool> DlssNrRunBeforeSr { false }; // experimental: run NR before DLSS SR
+    CustomOptional<bool> DlssNrPreDlaa { false }; // v10: private native-resolution DLAA resolve before NR, then re-jitter before SR
     // Toggles the pass in game. Unbound by default -- a key that does something unexpected is worse
     // than one that does nothing.
     CustomOptional<int> DlssNrToggleKey { UnboundKey };

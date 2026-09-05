@@ -30,8 +30,17 @@ namespace DlssNr
 // timingQueue is the queue this command list will be executed on, when the caller knows it.
 // State::currentCommandQueue only exists once a D3D12 swapchain has been created, which a Vulkan
 // game never does -- so without this the pass runs and never reports what it cost.
+// Experimental pre-SR path. NR runs on an OptiScaler-owned scratch texture and is copied back
+// into the game's ORIGINAL Color resource. NVSDK_NGX_Parameter_Color itself is never replaced.
+ID3D12Resource* EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,
+                                      ID3D12CommandQueue* timingQueue = nullptr);
+
+// V10 preserves original final-SR jitter; RestoreAfterUpscale only restores the temporary Reset override.
+void RestoreAfterUpscale(NVSDK_NGX_Parameter* params);
+
 void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,
-                          ID3D12CommandQueue* timingQueue = nullptr);
+                          ID3D12CommandQueue* timingQueue = nullptr,
+                          bool forceForPreSrScratch = false);
 
 
 

@@ -788,7 +788,8 @@ __declspec(dllexport) int dlssnr_call_evaluate(ID3D12GraphicsCommandList *cmd, v
                                                unsigned int guideHeight, int depthInverted, int reset,
                                                float intensity, int style, float localStructure,
                                                float localTone, float skinStructure, int useAutoMask,
-                                               float mvScaleX, float mvScaleY) {
+                                               float mvScaleX, float mvScaleY,
+                                               float jitterX, float jitterY) {
     if (!feature || !capabilityParams || !g_snip.evaluate) {
         return 0;
     }
@@ -827,6 +828,10 @@ __declspec(dllexport) int dlssnr_call_evaluate(ID3D12GraphicsCommandList *cmd, v
     // the model almost nothing had moved.
     setFloat(capabilityParams, "DLSSNR.MVecScaleX", mvScaleX);
     setFloat(capabilityParams, "DLSSNR.MVecScaleY", mvScaleY);
+    // V10.2.1: preserve temporal history but tell Feature 18 where this frame's projection sample is.
+    // These are the exact generic NGX jitter keys used by NVIDIA's temporal neural helpers.
+    setFloat(capabilityParams, "Jitter.Offset.X", jitterX);
+    setFloat(capabilityParams, "Jitter.Offset.Y", jitterY);
 
     setFloat(capabilityParams, "DLSSNR.Intensity", intensity);
     setUInt(capabilityParams, "DLSSNR.Style", (unsigned int) style);

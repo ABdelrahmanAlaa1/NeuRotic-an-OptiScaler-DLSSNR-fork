@@ -1157,8 +1157,14 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
         {
             LOG_DEBUG("Passthrough to native DLSS EvaluateFeature for handle {}", handleId);
 
+            if (feature != NVSDK_NGX_Feature_FrameGeneration)
+                DlssNr::EvaluateBeforeUpscale(InCmdList, InParameters);
+
             NVSDK_NGX_Result result =
                 NVNGXProxy::D3D12_EvaluateFeature()(InCmdList, InFeatureHandle, InParameters, InCallback);
+
+            DlssNr::RestoreAfterUpscale(InParameters);
+
             LOG_DEBUG("Native DLSS EvaluateFeature result: 0x{:X}", (uint32_t) result);
 
             // Neural Rendering runs over what the upscaler just wrote, on the same list, so frame
@@ -1190,7 +1196,13 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
         InParameters->Set("DLSSG.CameraFar", lastDlssgCameraFar.value());
 
     // OptiScaler internal handling
-    const NVSDK_NGX_Result optiResult = TryEvaluateOptiFeature(InCmdList, InFeatureHandle, InParameters, InCallback);
+    if (feature != NVSDK_NGX_Feature_FrameGeneration)
+        DlssNr::EvaluateBeforeUpscale(InCmdList, InParameters);
+
+    const NVSDK_NGX_Result optiResult =
+        TryEvaluateOptiFeature(InCmdList, InFeatureHandle, InParameters, InCallback);
+
+    DlssNr::RestoreAfterUpscale(InParameters);
 
     // Same pass, for OptiScaler's own upscalers rather than native DLSS.
     if (optiResult == NVSDK_NGX_Result_Success && feature != NVSDK_NGX_Feature_FrameGeneration)

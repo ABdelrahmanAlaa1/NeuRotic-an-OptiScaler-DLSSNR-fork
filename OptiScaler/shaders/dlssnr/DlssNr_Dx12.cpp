@@ -155,7 +155,7 @@ using PFN_NrCreate = void*(__cdecl*) (const wchar_t*, const wchar_t*, ID3D12Devi
 using PFN_NrEvaluate = int(__cdecl*) (ID3D12GraphicsCommandList*, void*, void*, ID3D12Resource*,
                                       ID3D12Resource*, ID3D12Resource*, ID3D12Resource*, unsigned int,
                                       unsigned int, unsigned int, unsigned int, int, int, float, int,
-                                      float, float, float, int, float, float);
+                                      float, float, float, int, float, float, float, float);
 using PFN_NrRelease = void(__cdecl*) (void*);
 using PFN_NrSetExtras = void(__cdecl*) (void*, float, ID3D12Resource*, ID3D12Resource*, ID3D12Resource*,
                                         unsigned int, unsigned int, unsigned int, unsigned int);
@@ -202,6 +202,29 @@ struct NrState
     // The model cannot read and write one resource, so the frame is staged through these.
     ID3D12Resource* colorCopy = nullptr;
     ID3D12Resource* output = nullptr;
+    ID3D12Resource* preSrScratch = nullptr;
+    ID3D12Resource* preSrRejitter = nullptr;
+    bool preSrScratchPrimed = false;
+    uint32_t preSrObservedWidth = 0;
+    uint32_t preSrObservedHeight = 0;
+    DXGI_FORMAT preSrObservedFormat = DXGI_FORMAT_UNKNOWN;
+    uint32_t preSrObservedOutWidth = 0;
+    uint32_t preSrObservedOutHeight = 0;
+    DXGI_FORMAT preSrObservedOutFormat = DXGI_FORMAT_UNKNOWN;
+    int preSrObservedPerfQuality = -999999;
+    uint32_t preSrStableFrames = 0;
+    NVSDK_NGX_Handle* preDlaaFeature = nullptr;
+    ID3D12Resource* preDlaaOutput = nullptr;
+    uint32_t preDlaaWidth = 0;
+    uint32_t preDlaaHeight = 0;
+    DXGI_FORMAT preDlaaFormat = DXGI_FORMAT_UNKNOWN;
+    uint32_t preDlaaWarmFrames = 0;
+    bool preDlaaNeedsReset = true;
+    bool preDlaaFinalResetPending = true;
+    bool preDlaaFinalOverrideActive = false;
+    float preDlaaSavedJitterX = 0.0f;
+    float preDlaaSavedJitterY = 0.0f;
+    int preDlaaSavedReset = 0;
 
     // The frame as the upscaler wrote it. The resolve adds the model's edit to this rather than
     // reconstructing it by inverting the tone curve, which is what turned every light in the frame into
@@ -726,7 +749,7 @@ void ReleaseSurfacesIfFormatChanged(DXGI_FORMAT needed)
         ParkNrFeature(f);
 
     for (ID3D12Resource** r :
-         { &g_nr.output, &g_nr.colorCopy, &g_nr.hdrCopy, &g_nr.colorSmall })
+         { &g_nr.output, &g_nr.colorCopy, &g_nr.hdrCopy, &g_nr.colorSmall, &g_nr.preSrScratch, &g_nr.preSrRejitter })
         ParkNrResource(*r);
 
     g_nr.reset = true;
@@ -1655,8 +1678,31 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     // Capped at 2x: cost grows with the area and NGX acceptance above native is what this probe tests.
     float workScale = cfg.DlssNrWorkingScale.value_or_default();
     workScale = workScale < 0.25f ? 0.25f : (workScale > 2.0f ? 2.0f : workScale);
-    const auto workWidth = (unsigned int) (width * workScale + 0.5f);
-    const auto workHeight = (unsigned int) (height * workScale + 0.5f);
+    auto workWidth = (unsigned int) (width * workScale + 0.5f);
+    auto workHeight = (unsigned int) (height * workScale + 0.5f);
+
+    if (cfg.DlssNrRunBeforeSr.value_or_default())
+    {
+        const unsigned int alignedW = std::max(8u, workWidth & ~7u);
+        const unsigned int alignedH = std::max(8u, workHeight & ~7u);
+
+        if (alignedW != workWidth || alignedH != workHeight)
+        {
+            static unsigned int saidW = 0, saidH = 0;
+            if (saidW != workWidth || saidH != workHeight)
+            {
+                saidW = workWidth;
+                saidH = workHeight;
+                LOG_WARN("DLSS-NR v10 DLAA-base: aligning private MODEL size {}x{} -> {}x{}; "
+                         "game/DLSS resources remain exact",
+                         workWidth, workHeight, alignedW, alignedH);
+            }
+
+            workWidth = alignedW;
+            workHeight = alignedH;
+        }
+    }
+
     const bool reduced = workWidth != width || workHeight != height;
 
     ReleaseSurfacesIfFormatChanged(desc.Format);
@@ -1688,6 +1734,10 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             ParkNrResource(g_nr.hdrCopy);
             ParkNrResource(g_nr.colorSmall);
             ParkNrResource(g_nr.outputNative);
+            ParkNrResource(g_nr.preSrScratch);
+            ParkNrResource(g_nr.preSrRejitter);
+            g_nr.preSrScratchPrimed = false;
+            g_nr.preSrStableFrames = 0;
         }
     }
 
@@ -2192,7 +2242,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         (int) cfg.DlssNrStyle.value_or_default(), cfg.DlssNrLocalStructure.value_or_default(),
         cfg.DlssNrLocalTone.value_or_default(), cfg.DlssNrSkinStructure.value_or_default(),
         cfg.DlssNrAutoMask.value_or_default() ? 1 : 0, g_nr.guideMvScaleX * mvToWork,
-        g_nr.guideMvScaleY * mvToWork);
+        g_nr.guideMvScaleY * mvToWork, frame.JitterX, frame.JitterY);
 
     if (g_ngxTime != nullptr)
         g_ngxTime->End(cmdList);
@@ -2468,13 +2518,624 @@ void RetryAfterFailure()
 
 }
 
-// Reads the game's parameter block and runs the pass on what it finds.
+struct PreDlaaRetired
+{
+    NVSDK_NGX_Handle* feature = nullptr;
+    ID3D12Resource* output = nullptr;
+    int framesLeft = 64;
+};
+
+std::vector<PreDlaaRetired> g_preDlaaRetired;
+
+void TickPreDlaaRetired()
+{
+    const auto release = NVNGXProxy::D3D12_ReleaseFeature();
+
+    for (size_t i = 0; i < g_preDlaaRetired.size();)
+    {
+        if (--g_preDlaaRetired[i].framesLeft > 0)
+        {
+            ++i;
+            continue;
+        }
+
+        if (g_preDlaaRetired[i].feature != nullptr && release != nullptr)
+            release(g_preDlaaRetired[i].feature);
+
+        if (g_preDlaaRetired[i].output != nullptr)
+            g_preDlaaRetired[i].output->Release();
+
+        g_preDlaaRetired.erase(g_preDlaaRetired.begin() + i);
+    }
+}
+
+void ParkPreDlaa()
+{
+    if (g_nr.preDlaaFeature == nullptr && g_nr.preDlaaOutput == nullptr)
+        return;
+
+    PreDlaaRetired retired;
+    retired.feature = g_nr.preDlaaFeature;
+    retired.output = g_nr.preDlaaOutput;
+    g_preDlaaRetired.push_back(retired);
+
+    g_nr.preDlaaFeature = nullptr;
+    g_nr.preDlaaOutput = nullptr;
+    g_nr.preDlaaWidth = 0;
+    g_nr.preDlaaHeight = 0;
+    g_nr.preDlaaFormat = DXGI_FORMAT_UNKNOWN;
+    g_nr.preDlaaWarmFrames = 0;
+    g_nr.preDlaaNeedsReset = true;
+    g_nr.preDlaaFinalResetPending = true;
+}
+
+void PreDlaaUavBarrier(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* resource)
+{
+    if (cmdList == nullptr || resource == nullptr)
+        return;
+
+    D3D12_RESOURCE_BARRIER barrier {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    barrier.UAV.pResource = resource;
+    cmdList->ResourceBarrier(1, &barrier);
+}
+
+ID3D12Resource* EvaluatePreDlaa(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,
+                                ID3D12Resource* color, ID3D12Device* device)
+{
+    TickPreDlaaRetired();
+
+    if (cmdList == nullptr || params == nullptr || color == nullptr || device == nullptr)
+        return nullptr;
+
+    const auto create = NVNGXProxy::D3D12_CreateFeature();
+    const auto evaluate = NVNGXProxy::D3D12_EvaluateFeature();
+
+    if (!NVNGXProxy::IsDx12Inited() || create == nullptr || evaluate == nullptr)
+    {
+        static bool saidUnavailable = false;
+        if (!saidUnavailable)
+        {
+            saidUnavailable = true;
+            LOG_WARN("DLSS-NR v10 DLAA-base: native NGX DLSS create/evaluate is unavailable");
+        }
+        return nullptr;
+    }
+
+    const D3D12_RESOURCE_DESC desc = color->GetDesc();
+    const uint32_t width = (uint32_t) desc.Width;
+    const uint32_t height = desc.Height;
+
+    const bool changed =
+        g_nr.preDlaaWidth != width ||
+        g_nr.preDlaaHeight != height ||
+        g_nr.preDlaaFormat != desc.Format;
+
+    if (changed)
+        ParkPreDlaa();
+
+    if (g_nr.preDlaaOutput == nullptr)
+    {
+        g_nr.preDlaaOutput = CreateScratch(device, desc.Format, width, height);
+
+        if (g_nr.preDlaaOutput == nullptr)
+        {
+            LOG_WARN("DLSS-NR v10 DLAA-base: could not create {}x{} private DLAA output", width, height);
+            return nullptr;
+        }
+
+        g_nr.preDlaaWidth = width;
+        g_nr.preDlaaHeight = height;
+        g_nr.preDlaaFormat = desc.Format;
+        g_nr.preDlaaNeedsReset = true;
+        g_nr.preDlaaFinalResetPending = true;
+        g_nr.preDlaaWarmFrames = 0;
+    }
+
+    unsigned int oldWidth = 0, oldHeight = 0, oldOutWidth = 0, oldOutHeight = 0;
+    int oldQuality = 0;
+
+    const bool haveShape =
+        params->Get(NVSDK_NGX_Parameter_Width, &oldWidth) == NVSDK_NGX_Result_Success &&
+        params->Get(NVSDK_NGX_Parameter_Height, &oldHeight) == NVSDK_NGX_Result_Success &&
+        params->Get(NVSDK_NGX_Parameter_OutWidth, &oldOutWidth) == NVSDK_NGX_Result_Success &&
+        params->Get(NVSDK_NGX_Parameter_OutHeight, &oldOutHeight) == NVSDK_NGX_Result_Success &&
+        params->Get(NVSDK_NGX_Parameter_PerfQualityValue, &oldQuality) == NVSDK_NGX_Result_Success;
+
+    if (!haveShape)
+    {
+        static bool saidMissing = false;
+        if (!saidMissing)
+        {
+            saidMissing = true;
+            LOG_WARN("DLSS-NR v10 DLAA-base: parameter block is missing creation dimensions/quality");
+        }
+        return nullptr;
+    }
+
+    if (g_nr.preDlaaFeature == nullptr)
+    {
+        params->Set(NVSDK_NGX_Parameter_Width, width);
+        params->Set(NVSDK_NGX_Parameter_Height, height);
+        params->Set(NVSDK_NGX_Parameter_OutWidth, width);
+        params->Set(NVSDK_NGX_Parameter_OutHeight, height);
+        params->Set(NVSDK_NGX_Parameter_PerfQualityValue, (int) NVSDK_NGX_PerfQuality_Value_DLAA);
+
+        NVSDK_NGX_Handle* handle = nullptr;
+        const NVSDK_NGX_Result createResult =
+            create(cmdList, NVSDK_NGX_Feature_SuperSampling, params, &handle);
+
+        params->Set(NVSDK_NGX_Parameter_Width, oldWidth);
+        params->Set(NVSDK_NGX_Parameter_Height, oldHeight);
+        params->Set(NVSDK_NGX_Parameter_OutWidth, oldOutWidth);
+        params->Set(NVSDK_NGX_Parameter_OutHeight, oldOutHeight);
+        params->Set(NVSDK_NGX_Parameter_PerfQualityValue, oldQuality);
+
+        if (createResult != NVSDK_NGX_Result_Success || handle == nullptr)
+        {
+            LOG_WARN("DLSS-NR v10 DLAA-base: PRIVATE DLAA CreateFeature failed 0x{:X} ({})",
+                     (unsigned int) createResult, NgxResultName((unsigned int) createResult));
+            ParkPreDlaa();
+            return nullptr;
+        }
+
+        g_nr.preDlaaFeature = handle;
+        g_nr.preDlaaNeedsReset = true;
+        g_nr.preDlaaFinalResetPending = true;
+        g_nr.preDlaaWarmFrames = 0;
+
+        LOG_WARN("DLSS-NR v10 DLAA-base: created PRIVATE DLAA feature {}x{} -> {}x{}; "
+                 "warming its own temporal history",
+                 width, height, width, height);
+
+        // Same conservative rule used for NR: don't create and evaluate a new temporal feature
+        // in the same command-list frame.
+        return nullptr;
+    }
+
+    void* oldOutput = nullptr;
+    if (params->Get(NVSDK_NGX_Parameter_Output, &oldOutput) != NVSDK_NGX_Result_Success ||
+        oldOutput == nullptr)
+        return nullptr;
+
+    int oldReset = 0;
+    const bool haveReset =
+        params->Get(NVSDK_NGX_Parameter_Reset, &oldReset) == NVSDK_NGX_Result_Success;
+
+    params->Set(NVSDK_NGX_Parameter_Width, width);
+    params->Set(NVSDK_NGX_Parameter_Height, height);
+    params->Set(NVSDK_NGX_Parameter_OutWidth, width);
+    params->Set(NVSDK_NGX_Parameter_OutHeight, height);
+    params->Set(NVSDK_NGX_Parameter_PerfQualityValue, (int) NVSDK_NGX_PerfQuality_Value_DLAA);
+    params->Set(NVSDK_NGX_Parameter_Output, g_nr.preDlaaOutput);
+
+    if (haveReset)
+        params->Set(NVSDK_NGX_Parameter_Reset, (oldReset != 0 || g_nr.preDlaaNeedsReset) ? 1 : 0);
+
+    const NVSDK_NGX_Result evalResult =
+        evaluate(cmdList, g_nr.preDlaaFeature, params, nullptr);
+
+    params->Set(NVSDK_NGX_Parameter_Output, oldOutput);
+    params->Set(NVSDK_NGX_Parameter_Width, oldWidth);
+    params->Set(NVSDK_NGX_Parameter_Height, oldHeight);
+    params->Set(NVSDK_NGX_Parameter_OutWidth, oldOutWidth);
+    params->Set(NVSDK_NGX_Parameter_OutHeight, oldOutHeight);
+    params->Set(NVSDK_NGX_Parameter_PerfQualityValue, oldQuality);
+
+    if (haveReset)
+        params->Set(NVSDK_NGX_Parameter_Reset, oldReset);
+
+    if (evalResult != NVSDK_NGX_Result_Success)
+    {
+        LOG_WARN("DLSS-NR v10 DLAA-base: PRIVATE DLAA EvaluateFeature failed 0x{:X} ({})",
+                 (unsigned int) evalResult, NgxResultName((unsigned int) evalResult));
+        ParkPreDlaa();
+        return nullptr;
+    }
+
+    g_nr.preDlaaNeedsReset = false;
+    PreDlaaUavBarrier(cmdList, g_nr.preDlaaOutput);
+
+    constexpr uint32_t kPreDlaaWarmFrames = 8;
+    if (g_nr.preDlaaWarmFrames < kPreDlaaWarmFrames)
+    {
+        ++g_nr.preDlaaWarmFrames;
+
+        if (g_nr.preDlaaWarmFrames == kPreDlaaWarmFrames)
+        {
+            LOG_WARN("DLSS-NR v10 DLAA-base: private DLAA history is warm at {}x{}; "
+                     "DLAA -> NR -> re-jitter -> SR activates next frame",
+                     width, height);
+        }
+
+        return nullptr;
+    }
+
+    return g_nr.preDlaaOutput;
+}
+
+void RestoreAfterUpscale(NVSDK_NGX_Parameter* params)
+{
+    if (params == nullptr || !g_nr.preDlaaFinalOverrideActive)
+        return;
+
+    // V10 never changes the final-SR jitter metadata. Only Restore the temporary one-shot Reset override.
+    params->Set(NVSDK_NGX_Parameter_Reset, g_nr.preDlaaSavedReset);
+    g_nr.preDlaaFinalOverrideActive = false;
+}
+
+ID3D12Resource* EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,
+                                      ID3D12CommandQueue* timingQueue)
+{
+    const Config& cfg = *Config::Instance();
+
+    if (!cfg.DlssNrEnabled.value_or_default() || !cfg.DlssNrRunBeforeSr.value_or_default() ||
+        cmdList == nullptr || params == nullptr)
+        return nullptr;
+
+    if (cfg.OutputResourceBarrier.has_value())
+        return nullptr;
+
+    ID3D12Resource* color = GetResource(params, NVSDK_NGX_Parameter_Color, "DLSS.Color");
+    if (color == nullptr)
+        return nullptr;
+
+    void* originalOutputVoid = nullptr;
+    if (params->Get(NVSDK_NGX_Parameter_Output, &originalOutputVoid) != NVSDK_NGX_Result_Success ||
+        originalOutputVoid == nullptr)
+        return nullptr;
+
+    const D3D12_RESOURCE_DESC colorDesc = color->GetDesc();
+    if (colorDesc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        colorDesc.DepthOrArraySize != 1 || colorDesc.MipLevels != 1 ||
+        colorDesc.SampleDesc.Count != 1 || colorDesc.Width == 0 || colorDesc.Height == 0)
+        return nullptr;
+
+    ID3D12Device* device = nullptr;
+    if (FAILED(color->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr)
+        return nullptr;
+
+    const uint32_t observedWidth = (uint32_t) colorDesc.Width;
+    const uint32_t observedHeight = colorDesc.Height;
+
+    ID3D12Resource* gameOutput = static_cast<ID3D12Resource*>(originalOutputVoid);
+    const D3D12_RESOURCE_DESC outputDesc = gameOutput->GetDesc();
+    const uint32_t observedOutWidth = (uint32_t) outputDesc.Width;
+    const uint32_t observedOutHeight = outputDesc.Height;
+
+    int perfQuality = -999999;
+    const bool havePerfQuality =
+        params->Get(NVSDK_NGX_Parameter_PerfQualityValue, &perfQuality) == NVSDK_NGX_Result_Success;
+
+    int resetValue = 0;
+    const bool resetRequested =
+        params->Get(NVSDK_NGX_Parameter_Reset, &resetValue) == NVSDK_NGX_Result_Success &&
+        resetValue != 0;
+
+    const bool inputChanged =
+        g_nr.preSrObservedWidth != observedWidth ||
+        g_nr.preSrObservedHeight != observedHeight ||
+        g_nr.preSrObservedFormat != colorDesc.Format;
+
+    const bool outputChanged =
+        g_nr.preSrObservedOutWidth != observedOutWidth ||
+        g_nr.preSrObservedOutHeight != observedOutHeight ||
+        g_nr.preSrObservedOutFormat != outputDesc.Format;
+
+    const bool qualityChanged =
+        havePerfQuality &&
+        g_nr.preSrObservedPerfQuality != -999999 &&
+        g_nr.preSrObservedPerfQuality != perfQuality;
+
+    const bool firstObservation =
+        g_nr.preSrObservedWidth == 0 ||
+        g_nr.preSrObservedHeight == 0 ||
+        g_nr.preSrObservedOutWidth == 0 ||
+        g_nr.preSrObservedOutHeight == 0;
+
+    if (firstObservation || inputChanged || outputChanged || qualityChanged || resetRequested)
+    {
+        const int oldQuality = g_nr.preSrObservedPerfQuality;
+
+        g_nr.preSrObservedWidth = observedWidth;
+        g_nr.preSrObservedHeight = observedHeight;
+        g_nr.preSrObservedFormat = colorDesc.Format;
+        g_nr.preSrObservedOutWidth = observedOutWidth;
+        g_nr.preSrObservedOutHeight = observedOutHeight;
+        g_nr.preSrObservedOutFormat = outputDesc.Format;
+
+        if (havePerfQuality)
+            g_nr.preSrObservedPerfQuality = perfQuality;
+
+        g_nr.preSrStableFrames = 0;
+        ParkNrResource(g_nr.preSrScratch);
+        ParkNrResource(g_nr.preSrRejitter);
+        g_nr.preSrScratchPrimed = false;
+        ParkPreDlaa();
+
+        LOG_WARN("DLSS-NR v10 RAW PRE-SR: DLSS transition detected "
+                 "(reset={}, input {}x{}, output {}x{}, quality {} -> {}); "
+                 "raw pre-SR NR is bypassed while NGX settles",
+                 resetRequested ? 1 : 0,
+                 observedWidth, observedHeight,
+                 observedOutWidth, observedOutHeight,
+                 oldQuality, havePerfQuality ? perfQuality : oldQuality);
+
+        device->Release();
+        return nullptr;
+    }
+
+    constexpr uint32_t kPreSrModeSettleFrames = 20;
+    if (g_nr.preSrStableFrames < kPreSrModeSettleFrames)
+    {
+        ++g_nr.preSrStableFrames;
+
+        if (g_nr.preSrStableFrames == kPreSrModeSettleFrames)
+        {
+            LOG_WARN("DLSS-NR v10 RAW PRE-SR: game DLSS mode stable at {}x{} -> {}x{}; "
+                     "raw pre-SR NR initializes next",
+                     observedWidth, observedHeight, observedOutWidth, observedOutHeight);
+        }
+
+        device->Release();
+        return nullptr;
+    }
+
+    ID3D12Resource* nrBase = color;
+    bool usingPreDlaa = false;
+
+    if (cfg.DlssNrPreDlaa.value_or_default())
+    {
+        nrBase = EvaluatePreDlaa(cmdList, params, color, device);
+
+        // Deliberately no raw->NR fallback. While DLAA is creating/warming, leave Wilds' normal
+        // DLSS path completely untouched so the two temporal histories never get mixed.
+        if (nrBase == nullptr)
+        {
+            device->Release();
+            return nullptr;
+        }
+
+        usingPreDlaa = true;
+    }
+
+    const bool scratchMismatch =
+        g_nr.preSrScratch == nullptr ||
+        g_nr.preSrRejitter == nullptr ||
+        g_nr.preSrScratch->GetDesc().Width != colorDesc.Width ||
+        g_nr.preSrScratch->GetDesc().Height != colorDesc.Height ||
+        g_nr.preSrScratch->GetDesc().Format != colorDesc.Format ||
+        g_nr.preSrRejitter->GetDesc().Width != colorDesc.Width ||
+        g_nr.preSrRejitter->GetDesc().Height != colorDesc.Height ||
+        g_nr.preSrRejitter->GetDesc().Format != colorDesc.Format;
+
+    if (scratchMismatch)
+    {
+        ParkNrResource(g_nr.preSrScratch);
+        ParkNrResource(g_nr.preSrRejitter);
+        g_nr.preSrScratchPrimed = false;
+        g_nr.preSrScratch = CreateScratch(device, colorDesc.Format, observedWidth, observedHeight);
+        g_nr.preSrRejitter = CreateScratch(device, colorDesc.Format, observedWidth, observedHeight);
+    }
+
+    if (g_nr.preSrScratch == nullptr || g_nr.preSrRejitter == nullptr)
+    {
+        device->Release();
+        return nullptr;
+    }
+
+    const D3D12_RESOURCE_STATES baseState =
+        usingPreDlaa ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+                     : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+    Barrier(cmdList, g_nr.preSrScratch, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_DEST);
+    Barrier(cmdList, nrBase, baseState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    cmdList->CopyResource(g_nr.preSrScratch, nrBase);
+    Barrier(cmdList, nrBase, D3D12_RESOURCE_STATE_COPY_SOURCE, baseState);
+    Barrier(cmdList, g_nr.preSrScratch, D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    float expectedScale = cfg.DlssNrWorkingScale.value_or_default();
+    expectedScale = expectedScale < 0.25f ? 0.25f : (expectedScale > 2.0f ? 2.0f : expectedScale);
+
+    unsigned int expectedWorkW = (unsigned int) (observedWidth * expectedScale + 0.5f);
+    unsigned int expectedWorkH = (unsigned int) (observedHeight * expectedScale + 0.5f);
+    expectedWorkW = std::max(8u, expectedWorkW & ~7u);
+    expectedWorkH = std::max(8u, expectedWorkH & ~7u);
+
+    const bool featureReadyBefore =
+        g_nr.feature != nullptr &&
+        g_nr.width == observedWidth &&
+        g_nr.height == observedHeight &&
+        g_nr.workWidth == expectedWorkW &&
+        g_nr.workHeight == expectedWorkH &&
+        TuningMatchesFeature(cfg);
+
+    params->Set(NVSDK_NGX_Parameter_Output, g_nr.preSrScratch);
+    EvaluateAfterUpscale(cmdList, params, timingQueue, true);
+    params->Set(NVSDK_NGX_Parameter_Output, originalOutputVoid);
+
+    if (!featureReadyBefore)
+    {
+        g_nr.preSrScratchPrimed = true;
+        device->Release();
+        return nullptr;
+    }
+
+    float jitterX = 0.0f, jitterY = 0.0f;
+    int originalReset = 0;
+
+    const bool haveFinalReset =
+        params->Get(NVSDK_NGX_Parameter_Reset, &originalReset) == NVSDK_NGX_Result_Success;
+
+    if (usingPreDlaa)
+    {
+        const bool haveJitter =
+            params->Get(NVSDK_NGX_Parameter_Jitter_Offset_X, &jitterX) == NVSDK_NGX_Result_Success &&
+            params->Get(NVSDK_NGX_Parameter_Jitter_Offset_Y, &jitterY) == NVSDK_NGX_Result_Success;
+
+        if (!haveJitter)
+        {
+            static bool saidNoJitter = false;
+            if (!saidNoJitter)
+            {
+                saidNoJitter = true;
+                LOG_WARN("DLSS-NR v10 re-jitter: final SR jitter parameters are unavailable; bypassing DLAA/NR handoff");
+            }
+            device->Release();
+            return nullptr;
+        }
+
+        // DLAA made the NR base stable/de-jittered. Recreate THIS frame's original raster phase
+        // in a PRIVATE UAV-capable surface before copying it into Wilds' original Color texture.
+        Barrier(cmdList, g_nr.preSrScratch,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+        DlssNrConstants rejitter {};
+        rejitter.Mode = 5;
+        rejitter.Width = observedWidth;
+        rejitter.Height = observedHeight;
+        rejitter.MvScaleX = jitterX;
+        rejitter.MvScaleY = jitterY;
+
+        // V10 FIX: DispatchPass binds OptiScaler's descriptor heap, compute root signature and PSO.
+        // V8 called it directly here, outside the state envelope used by the normal NR path. On
+        // bindless engines such as Monster Hunter Wilds that lets the game resume from OptiScaler's
+        // compute bindings; the first active handoff then surfaces as a driver-side access violation.
+        //
+        // Mirror DlssNr_Dx12::Dispatch exactly: if Wilds requires root-state restore, only run when
+        // the hooks have a restorable game state, serialize g_compose's rotating descriptor heaps,
+        // and restore the game's compute state on every exit from the custom dispatch.
+        const bool restoreRequired =
+            cfg.RestoreComputeSignature.value_or_default() ||
+            cfg.RestoreGraphicSignature.value_or_default();
+
+        if (restoreRequired)
+            D3D12Hooks::HookToCommandListLate(cmdList);
+
+        if (restoreRequired && !D3D12Hooks::CanRestoreRootSignature(cmdList))
+        {
+            static bool saidNoRejitterRestore = false;
+            if (!saidNoRejitterRestore)
+            {
+                saidNoRejitterRestore = true;
+                LOG_WARN("DLSS-NR v10 re-jitter: Wilds root state is not restorable on this command list; "
+                         "bypassing the custom handoff for safety");
+            }
+
+            Barrier(cmdList, g_nr.preSrScratch,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            device->Release();
+            return nullptr;
+        }
+
+        bool rejitterOk = false;
+        {
+            std::lock_guard<std::mutex> nrLock(g_nrMutex);
+            ScopedNrStateEnvelope stateEnvelope(cmdList);
+            rejitterOk = g_compose != nullptr &&
+                g_compose->DispatchPass(cmdList, rejitter,
+                                        g_nr.preSrScratch, nullptr, nullptr,
+                                        nullptr, nullptr,
+                                        g_nr.preSrRejitter, nullptr);
+        }
+
+        Barrier(cmdList, g_nr.preSrScratch,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+        if (rejitterOk)
+        {
+            static bool saidStateSafeRejitter = false;
+            if (!saidStateSafeRejitter)
+            {
+                saidStateSafeRejitter = true;
+                LOG_WARN("DLSS-NR v10 re-jitter: state-safe dispatch active (serialized + state envelope)");
+            }
+        }
+
+        if (!rejitterOk)
+        {
+            static bool saidRejitterFail = false;
+            if (!saidRejitterFail)
+            {
+                saidRejitterFail = true;
+                LOG_WARN("DLSS-NR v10 re-jitter: fractional shift dispatch failed; leaving Wilds native DLSS input untouched");
+            }
+            device->Release();
+            return nullptr;
+        }
+
+        Barrier(cmdList, g_nr.preSrRejitter,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE);
+        Barrier(cmdList, color,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_COPY_DEST);
+        cmdList->CopyResource(color, g_nr.preSrRejitter);
+        Barrier(cmdList, color,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Barrier(cmdList, g_nr.preSrRejitter,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+        if (haveFinalReset)
+        {
+            // IMPORTANT: do NOT alter Jitter.Offset.X/Y. The color was just re-jittered to match
+            // those original values. Only force a one-shot history reset on the first handoff.
+            g_nr.preDlaaSavedReset = originalReset;
+            g_nr.preDlaaFinalOverrideActive = true;
+
+            params->Set(NVSDK_NGX_Parameter_Reset,
+                        (originalReset != 0 || g_nr.preDlaaFinalResetPending) ? 1 : 0);
+
+            g_nr.preDlaaFinalResetPending = false;
+        }
+    }
+    else
+    {
+        // Safety fallback if PreDlaa is manually disabled: this is a raw/jittered NR result already,
+        // so copy it back exactly like v6. Re-jittering here would double-apply the game's jitter.
+        Barrier(cmdList, g_nr.preSrScratch,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE);
+        Barrier(cmdList, color,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_COPY_DEST);
+        cmdList->CopyResource(color, g_nr.preSrScratch);
+        Barrier(cmdList, color,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Barrier(cmdList, g_nr.preSrScratch,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+
+    g_nr.preSrScratchPrimed = true;
+
+    static bool saidActive = false;
+    if (!saidActive)
+    {
+        saidActive = true;
+        LOG_WARN("DLSS-NR v10 RAW PRE-SR ACTIVE: jittered Color {}x{} -> NR at 100% input resolution -> "
+                 "original Color -> native DLSS SR {}x{}; original depth/MVs/jitter/exposure preserved",
+                 observedWidth, observedHeight,
+                 observedOutWidth, observedOutHeight);
+    }
+
+    device->Release();
+    return color;
+}// Reads the game's parameter block and runs the pass on what it finds.
 //
 // This is the call site's job, not the pass's. A caller that has the resources in hand -- a
 // reprojection stage, a frame generation path, anything that is not the upscaler seam -- calls
 // RunPass directly and never touches an NGX parameter block.
 void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,
-                          ID3D12CommandQueue* timingQueue)
+                          ID3D12CommandQueue* timingQueue, bool forceForPreSrScratch)
 {
     if (!Config::Instance()->DlssNrEnabled.value_or_default())
     {
@@ -2487,6 +3148,11 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
         ReportSkipOnce("no command list or no parameter block");
         return;
     }
+
+    // In pre-SR mode the ordinary call site after DLSS must not run NR a second time.
+    // EvaluateBeforeUpscale explicitly forces this function only while Output points at our scratch.
+    if (Config::Instance()->DlssNrRunBeforeSr.value_or_default() && !forceForPreSrScratch)
+        return;
 
     // Which of the game's APIs this evaluate arrived through.
     //
@@ -2550,6 +3216,33 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
 
     if (params->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &frame.MvScaleY) != NVSDK_NGX_Result_Success)
         frame.MvScaleY = 1.0f;
+
+    const bool haveNrJitter =
+        params->Get(NVSDK_NGX_Parameter_Jitter_Offset_X, &frame.JitterX) == NVSDK_NGX_Result_Success &&
+        params->Get(NVSDK_NGX_Parameter_Jitter_Offset_Y, &frame.JitterY) == NVSDK_NGX_Result_Success;
+
+    if (!haveNrJitter)
+    {
+        frame.JitterX = 0.0f;
+        frame.JitterY = 0.0f;
+    }
+
+    if (forceForPreSrScratch)
+    {
+        static bool saidJitter = false;
+        static bool saidMissingJitter = false;
+        if (haveNrJitter && !saidJitter)
+        {
+            saidJitter = true;
+            LOG_WARN("DLSS-NR v10.2.2 JITTER-AWARE NR ACTIVE: history ON, passing original Wilds jitter ({:.4f}, {:.4f}) to Feature 18; native DLSS inputs untouched",
+                     frame.JitterX, frame.JitterY);
+        }
+        else if (!haveNrJitter && !saidMissingJitter)
+        {
+            saidMissingJitter = true;
+            LOG_WARN("DLSS-NR v10.2.2: Wilds jitter parameters unavailable; Feature 18 receives zero jitter");
+        }
+    }
 
     // What the game says about its own exposure. Logged, used for nothing yet.
     //
@@ -2882,6 +3575,28 @@ void Shutdown()
         g_nr.colorCopy->Release();
         g_nr.colorCopy = nullptr;
     }
+
+    if (g_nr.preSrScratch != nullptr)
+    {
+        g_nr.preSrScratch->Release();
+        g_nr.preSrScratch = nullptr;
+        g_nr.preSrScratchPrimed = false;
+    }
+
+    if (g_nr.preSrRejitter != nullptr)
+    {
+        g_nr.preSrRejitter->Release();
+        g_nr.preSrRejitter = nullptr;
+    }
+
+    g_nr.preSrObservedWidth = 0;
+    g_nr.preSrObservedHeight = 0;
+    g_nr.preSrObservedFormat = DXGI_FORMAT_UNKNOWN;
+    g_nr.preSrObservedOutWidth = 0;
+    g_nr.preSrObservedOutHeight = 0;
+    g_nr.preSrObservedOutFormat = DXGI_FORMAT_UNKNOWN;
+    g_nr.preSrObservedPerfQuality = -999999;
+    g_nr.preSrStableFrames = 0;
 
     if (g_nr.hdrCopy != nullptr)
     {

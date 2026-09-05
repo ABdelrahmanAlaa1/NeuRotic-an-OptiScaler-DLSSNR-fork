@@ -478,6 +478,24 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // Normalised, so the source may be any size relative to this dispatch.
     float2 uv = (float2(id.xy) + 0.5) / float2(gWidth, gHeight);
 
+    // EXPERIMENT V10: mode 5 -- fractional re-jitter of a stable same-resolution NR image.
+    // gMvScaleX/Y are repurposed here as the engine's ORIGINAL DLSS jitter, in render pixels.
+    // A +projection jitter moves scene content +jitter on the raster, so synthesising that raster
+    // from the stable image samples the stable image at x - jitter.
+    if (gMode == 5)
+    {
+        const float2 size = max(float2(gWidth, gHeight), 1.0);
+        const float2 jitterPixels = float2(gMvScaleX, gMvScaleY);
+        float2 sourceUv = uv - jitterPixels / size;
+
+        // Clamp to texel centres so the linear sampler never pulls border colour into the frame.
+        const float2 halfTexel = 0.5 / size;
+        sourceUv = clamp(sourceUv, halfTexel, 1.0 - halfTexel);
+
+        gTarget[id.xy] = gSource.SampleLevel(gLinear, sourceUv, 0);
+        return;
+    }
+
     // The meter. One thread per tile of a 64x64 grid over the frame, writing that tile's mean
     // luminance. The frame is raw linear here -- this runs before the encode, on purpose, because the
     // number being looked for is what the encode's divisor should be.
