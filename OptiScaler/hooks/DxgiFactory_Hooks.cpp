@@ -69,12 +69,9 @@ static bool PrepareDx12InteropDesc1(DXGI_SWAP_CHAIN_DESC1& desc)
 
 void DxgiFactoryHooks::HookToFactory(IDXGIFactory* pFactory)
 {
-    // Investigated 2026-09-06 (NBA 2K26 menu/overlay never initializing -- see
-    // memory/plans/2026-09-06-optiscaler-reshade-addon64.md's task-file entry): confirmed live that
-    // every IDXGIFactory instance this process saw shared one vtable (Detours patches the target
-    // function's machine code in place, not the vtable slot's stored pointer, so this guard's
-    // "hook the first factory, every later one is covered too" assumption held here). The actual gap
-    // was CreateSwapChainForComposition never being hooked at all -- see below.
+    // Every IDXGIFactory instance the process obtains shares one vtable, so hooking the first one
+    // covers every later instance too -- Detours patches the target function's machine code in
+    // place, not the vtable slot's stored pointer.
     if (pFactory == nullptr || o_EnumAdapters != nullptr)
         return;
 
@@ -279,12 +276,11 @@ HRESULT DxgiFactoryHooks::CreateSwapChain(IDXGIFactory* realFactory, IUnknown* p
         return res;
     }
 
-    // Diagnosed 2026-09-06 (NBA 2K26 menu never initializing): Width==0 && Height==0 with a real
-    // OutputWindow is DXGI's documented "size to the window's client area" idiom, not an overlay --
-    // confirmed live, NBA 2K26's actual swapchain (BufferCount 3, real HWND, Windowed) is created
-    // exactly this way and was previously being misclassified as "Overlay call!" and passed through
-    // unwrapped, which is why the menu/toast overlay never appeared. Only a genuinely tiny, non-zero
-    // descriptor (Steam/Discord-style overlay helper swapchains) should still take that path.
+    // Width==0 && Height==0 with a real OutputWindow is DXGI's documented "size to the window's
+    // client area" idiom, not an overlay -- treating it as tiny and leaving it unwrapped misses the
+    // game's real swapchain whenever it's created this way, which silently breaks anything driven off
+    // the wrapped swapchain's Present (the menu overlay). Only a genuinely tiny, non-zero descriptor
+    // (Steam/Discord-style overlay helper swapchains) should take that path.
     //
     // A non-null OutputWindow alone isn't enough to trust, though: a helper/overlay swapchain could
     // use this exact same 0x0 idiom against its OWN tiny/hidden window. Check the window's real
