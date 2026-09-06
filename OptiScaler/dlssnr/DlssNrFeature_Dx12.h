@@ -112,6 +112,37 @@ struct ExposureStatus
 
 ExposureStatus GameExposureStatus();
 
+// Low-overhead session telemetry for controlled performance/IQ comparisons.
+//
+// These are observations only. Reading them does not alter the model, rebuild resources, or change
+// any render-path decision. Frame is the colour/output raster NR is attached to; Work is the raster
+// the model itself evaluates; Guides are the active depth/motion subrect dimensions.
+struct TelemetrySnapshot
+{
+    unsigned long long frames = 0;
+    unsigned long long gameResets = 0;
+    unsigned long long featureBuilds = 0;
+    unsigned long long featureRebuilds = 0;
+    unsigned long long evaluateFailures = 0;
+
+    unsigned int frameWidth = 0;
+    unsigned int frameHeight = 0;
+    unsigned int workWidth = 0;
+    unsigned int workHeight = 0;
+    unsigned int guideWidth = 0;
+    unsigned int guideHeight = 0;
+
+    bool runBeforeSr = false;
+    bool running = false;
+    bool failed = false;
+    bool resetPending = false;
+
+    std::optional<double> totalGpuMs;
+    std::optional<double> modelGpuMs;
+};
+
+TelemetrySnapshot Telemetry();
+
 // The white point the exposure meter has settled on, or 0 if it has not taken a reading yet. For the
 // overlay, so the number in use is visible rather than inferred.
 

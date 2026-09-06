@@ -423,6 +423,13 @@ void ClearCaptureDirectory()
 
 unsigned long long g_frames = 0;
 
+// Session telemetry. These counters are deliberately observational: they are updated only at events
+// the render path already performs and never participate in a render decision.
+unsigned long long g_gameResetEvents = 0;
+unsigned long long g_featureBuilds = 0;
+unsigned long long g_featureRebuilds = 0;
+unsigned long long g_evaluateFailures = 0;
+
 // A capture requested from outside the game: when the render path has no fence of its own, the write
 // waits until this frame count, by which point the GPU is certainly past the copies.
 unsigned long long g_captureWriteAtFrame = 0;
@@ -741,6 +748,9 @@ void ReleaseSurfacesIfFormatChanged(DXGI_FORMAT needed)
              (int) g_nr.output->GetDesc().Format, (int) needed);
 
     ForgetCalibration();
+
+    if (g_nr.feature != nullptr)
+        ++g_featureRebuilds;
 
     ParkNrFeature(g_nr.feature);
 
@@ -1616,12 +1626,10 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     if (frame.Reset)
     {
         g_nr.reset = true;
+        ++g_gameResetEvents;
 
-        static unsigned long long resets = 0;
-        ++resets;
-
-        if (resets <= 3 || resets % 100 == 0)
-            LOG_INFO("DLSS-NR: the game asked for a history reset ({} so far)", resets);
+        if (g_gameResetEvents <= 3 || g_gameResetEvents % 100 == 0)
+            LOG_INFO("DLSS-NR: the game asked for a history reset ({} so far)", g_gameResetEvents);
     }
 
     // Logged whenever it changes, not once per session.
@@ -1718,6 +1726,8 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
 
     if (g_nr.feature != nullptr && (resolutionChanged || tuningChanged))
     {
+        ++g_featureRebuilds;
+
         // Parked rather than released: with frame generation the GPU can still be several frames
         // deep in work that references all of it.
         ParkNrFeature(g_nr.feature);
@@ -1835,6 +1845,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             return;
         }
 
+        ++g_featureBuilds;
         g_nr.width = width;
         g_nr.height = height;
         g_nr.reset = true;
@@ -2219,6 +2230,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
 
         if (proxyResult != 1)
         {
+            ++g_evaluateFailures;
             g_nr.failed = true;
             g_nr.reason = "the proxy path could not run the model";
             LOG_ERROR("DLSS-NR (proxy): evaluate returned 0x{:X} ({}), disabling for this session",
@@ -2434,6 +2446,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     }
     else
     {
+        ++g_evaluateFailures;
         g_nr.failed = true;
         g_nr.reason = "the model refused to run";
         LOG_ERROR("DLSS-NR evaluate returned 0x{:X} ({}), disabling for this session", (uint32_t) result,
@@ -2475,8 +2488,14 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
                 lastSplitLog = g_frames;
                 const double total = g_lastGpuTime.value();
                 const double ngx = g_lastNgxTime.value();
-                LOG_INFO("DLSS-NR cost: {:.2f} ms total = {:.2f} ms model + {:.2f} ms ours ({:.0f}% ours)",
-                         total, ngx, total - ngx, total > 0.0 ? 100.0 * (total - ngx) / total : 0.0);
+                LOG_INFO("DLSS-NR telemetry: frame {} | {} | frame {}x{} work {}x{} guides {}x{} | "
+                         "resets {} builds {} rebuilds {} eval failures {} | "
+                         "{:.2f} ms total = {:.2f} ms model + {:.2f} ms ours ({:.0f}% ours)",
+                         g_frames, cfg.DlssNrRunBeforeSr.value_or_default() ? "Pre-SR" : "Post-SR",
+                         g_nr.width, g_nr.height, g_nr.workWidth, g_nr.workHeight,
+                         g_nr.guideWidth, g_nr.guideHeight, g_gameResetEvents, g_featureBuilds,
+                         g_featureRebuilds, g_evaluateFailures, total, ngx, total - ngx,
+                         total > 0.0 ? 100.0 * (total - ngx) / total : 0.0);
             }
         }
     }
@@ -3524,6 +3543,29 @@ ExposureStatus GameExposureStatus()
     return s;
 }
 
+TelemetrySnapshot Telemetry()
+{
+    TelemetrySnapshot t {};
+    t.frames = g_frames;
+    t.gameResets = g_gameResetEvents;
+    t.featureBuilds = g_featureBuilds;
+    t.featureRebuilds = g_featureRebuilds;
+    t.evaluateFailures = g_evaluateFailures;
+    t.frameWidth = g_nr.width;
+    t.frameHeight = g_nr.height;
+    t.workWidth = g_nr.workWidth;
+    t.workHeight = g_nr.workHeight;
+    t.guideWidth = g_nr.guideWidth;
+    t.guideHeight = g_nr.guideHeight;
+    t.runBeforeSr = Config::Instance()->DlssNrRunBeforeSr.value_or_default();
+    t.running = g_nr.feature != nullptr && !g_nr.failed;
+    t.failed = g_nr.failed;
+    t.resetPending = g_nr.reset;
+    t.totalGpuMs = g_lastGpuTime;
+    t.modelGpuMs = g_lastNgxTime;
+    return t;
+}
+
 std::optional<double> LastGpuTime() { return g_lastGpuTime; }
 
 
@@ -3698,6 +3740,13 @@ void Shutdown()
     }
 
     g_capture.release();
+
+    g_frames = 0;
+    g_gameResetEvents = 0;
+    g_featureBuilds = 0;
+    g_featureRebuilds = 0;
+    g_evaluateFailures = 0;
+
     g_gpuTime.reset();
     g_ngxTime.reset();
     g_lastNgxTime.reset();

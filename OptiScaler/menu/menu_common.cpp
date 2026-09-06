@@ -7106,6 +7106,8 @@ void MenuCommon::RenderMainMenuGraphs(RenderMenuContext& ctx)
             {
                 ImGui::BeginTooltip();
 
+                const auto nrTelemetry = DlssNr::Telemetry();
+
                 ImGui::TextDisabled("Per shader breakdown:");
                 if (ImGui::BeginTable("ShaderTimes", 2, ImGuiTableFlags_SizingStretchProp))
                 {
@@ -7128,8 +7130,7 @@ void MenuCommon::RenderMainMenuGraphs(RenderMenuContext& ctx)
                         ImGui::Text(formattedTime.c_str());
                     }
 
-                    std::optional<double> nrTime {};
-                    nrTime = DlssNr::LastGpuTime();
+                    const auto nrTime = nrTelemetry.totalGpuMs;
                     if (hasExtra || nrTime.has_value())
                     {
                         ImGui::TableNextRow();
@@ -7158,10 +7159,43 @@ void MenuCommon::RenderMainMenuGraphs(RenderMenuContext& ctx)
                             ImGui::Text("Neural Rendering");
                             ImGui::TableNextColumn();
                             ImGui::Text(StrFmt("%.2f ms", nrTime.value()).c_str());
+
+                            if (nrTelemetry.modelGpuMs.has_value())
+                            {
+                                const double model = nrTelemetry.modelGpuMs.value();
+                                const double ours = std::max(0.0, nrTime.value() - model);
+
+                                ImGui::TableNextColumn();
+                                ImGui::Text("  NR model (NGX)");
+                                ImGui::TableNextColumn();
+                                ImGui::Text(StrFmt("%.2f ms", model).c_str());
+
+                                ImGui::TableNextColumn();
+                                ImGui::Text("  NR compose/copies");
+                                ImGui::TableNextColumn();
+                                ImGui::Text(StrFmt("%.2f ms", ours).c_str());
+                            }
                         }
                     }
 
                     ImGui::EndTable();
+                }
+
+                if (nrTelemetry.frames != 0)
+                {
+                    ImGui::Separator();
+                    ImGui::TextDisabled("Neural Rendering telemetry:");
+                    ImGui::Text("Status: %s | Mode: %s | Reset pending: %s",
+                                nrTelemetry.failed ? "failed" : (nrTelemetry.running ? "running" : "idle"),
+                                nrTelemetry.runBeforeSr ? "Pre-SR" : "Post-SR",
+                                nrTelemetry.resetPending ? "yes" : "no");
+                    ImGui::Text("Frame %ux%u | Work %ux%u | Guides %ux%u",
+                                nrTelemetry.frameWidth, nrTelemetry.frameHeight,
+                                nrTelemetry.workWidth, nrTelemetry.workHeight,
+                                nrTelemetry.guideWidth, nrTelemetry.guideHeight);
+                    ImGui::Text("Frames %llu | Game resets %llu | Builds %llu | Rebuilds %llu | Eval failures %llu",
+                                nrTelemetry.frames, nrTelemetry.gameResets, nrTelemetry.featureBuilds,
+                                nrTelemetry.featureRebuilds, nrTelemetry.evaluateFailures);
                 }
 
                 ImGui::EndTooltip();
