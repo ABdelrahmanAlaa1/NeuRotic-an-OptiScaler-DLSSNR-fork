@@ -285,8 +285,22 @@ HRESULT DxgiFactoryHooks::CreateSwapChain(IDXGIFactory* realFactory, IUnknown* p
     // exactly this way and was previously being misclassified as "Overlay call!" and passed through
     // unwrapped, which is why the menu/toast overlay never appeared. Only a genuinely tiny, non-zero
     // descriptor (Steam/Discord-style overlay helper swapchains) should still take that path.
-    bool sizeToWindow =
-        pDesc->BufferDesc.Width == 0 && pDesc->BufferDesc.Height == 0 && pDesc->OutputWindow != nullptr;
+    //
+    // A non-null OutputWindow alone isn't enough to trust, though: a helper/overlay swapchain could
+    // use this exact same 0x0 idiom against its OWN tiny/hidden window. Check the window's real
+    // client rect rather than trusting the pointer -- a hidden helper window resolves to a tiny or
+    // zero rect; the game's actual window won't.
+    bool sizeToWindow = false;
+    if (pDesc->BufferDesc.Width == 0 && pDesc->BufferDesc.Height == 0 && pDesc->OutputWindow != nullptr)
+    {
+        RECT clientRect {};
+        if (GetClientRect(pDesc->OutputWindow, &clientRect))
+        {
+            auto windowWidth = clientRect.right - clientRect.left;
+            auto windowHeight = clientRect.bottom - clientRect.top;
+            sizeToWindow = windowWidth >= 100 && windowHeight >= 100;
+        }
+    }
 
     if (!sizeToWindow && (pDesc->BufferDesc.Height < 100 || pDesc->BufferDesc.Width < 100))
     {
