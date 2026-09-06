@@ -217,6 +217,7 @@ struct NrState
     // of rendered frames, so high-refresh systems do not race through an arbitrary settle window.
     bool preSrAwaitingEvaluation = false;
     bool preSrResetWasRequested = false;
+    uint32_t preSrQuarantineFrames = 0;
     NVSDK_NGX_Handle* preDlaaFeature = nullptr;
     ID3D12Resource* preDlaaOutput = nullptr;
     uint32_t preDlaaWidth = 0;
@@ -437,6 +438,8 @@ unsigned long long g_evaluateFailures = 0;
 // A capture requested from outside the game: when the render path has no fence of its own, the write
 // waits until this frame count, by which point the GPU is certainly past the copies.
 unsigned long long g_captureWriteAtFrame = 0;
+
+constexpr uint32_t kPreSrQuarantineFrames = 20;
 
 // Dropping a file named dlssnr-capture.trigger beside OptiScaler requests a capture, so a session can
 // be asked for one from outside the game -- no alt-tab, no menu. Checked once a second, effectively.
@@ -1752,6 +1755,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             ParkNrResource(g_nr.preSrRejitter);
             g_nr.preSrScratchPrimed = false;
             g_nr.preSrAwaitingEvaluation = true;
+            g_nr.preSrQuarantineFrames = kPreSrQuarantineFrames;
         }
     }
 
@@ -2839,7 +2843,14 @@ ID3D12Resource* EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_
     // the rising edge; repeatedly parking the same resources while Reset remains high turns a
     // normal reset into an unnecessary teardown loop.
     const bool resetEdge = resetRequested && !g_nr.preSrResetWasRequested;
+    const bool resetEnded = !resetRequested && g_nr.preSrResetWasRequested;
     g_nr.preSrResetWasRequested = resetRequested;
+
+    // A reset can remain asserted across several evaluations. The old 20-frame guard stayed
+    // bypassed for the entire held-reset interval; rising-edge readiness must preserve that safety
+    // property and add the settle window after Reset falls as well.
+    if (resetRequested || resetEnded)
+        g_nr.preSrQuarantineFrames = kPreSrQuarantineFrames;
 
     const bool inputChanged =
         g_nr.preSrObservedWidth != observedWidth ||
@@ -2862,7 +2873,7 @@ ID3D12Resource* EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_
         g_nr.preSrObservedOutWidth == 0 ||
         g_nr.preSrObservedOutHeight == 0;
 
-    if (firstObservation || inputChanged || outputChanged || qualityChanged || resetEdge)
+    if (firstObservation || inputChanged || outputChanged || qualityChanged || resetEdge || resetEnded)
     {
         const int oldQuality = g_nr.preSrObservedPerfQuality;
 
@@ -2877,6 +2888,7 @@ ID3D12Resource* EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_
             g_nr.preSrObservedPerfQuality = perfQuality;
 
         g_nr.preSrAwaitingEvaluation = true;
+        g_nr.preSrQuarantineFrames = kPreSrQuarantineFrames;
         ParkNrResource(g_nr.preSrScratch);
         ParkNrResource(g_nr.preSrRejitter);
         g_nr.preSrScratchPrimed = false;
@@ -2889,6 +2901,18 @@ ID3D12Resource* EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_
                  observedWidth, observedHeight,
                  observedOutWidth, observedOutHeight,
                  oldQuality, havePerfQuality ? perfQuality : oldQuality);
+
+        device->Release();
+        return nullptr;
+    }
+
+    if (g_nr.preSrQuarantineFrames != 0)
+    {
+        --g_nr.preSrQuarantineFrames;
+        if (g_nr.preSrQuarantineFrames == 0)
+        {
+            LOG_WARN("DLSS-NR v10 RAW PRE-SR: transition quarantine complete; testing the new path");
+        }
 
         device->Release();
         return nullptr;
@@ -3654,6 +3678,7 @@ void Shutdown()
     g_nr.preSrObservedPerfQuality = -999999;
     g_nr.preSrAwaitingEvaluation = false;
     g_nr.preSrResetWasRequested = false;
+    g_nr.preSrQuarantineFrames = 0;
 
     if (g_nr.hdrCopy != nullptr)
     {
