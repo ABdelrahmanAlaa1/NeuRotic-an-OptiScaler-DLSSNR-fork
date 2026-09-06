@@ -2850,7 +2850,10 @@ ID3D12Resource* EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_
     // bypassed for the entire held-reset interval; rising-edge readiness must preserve that safety
     // property and add the settle window after Reset falls as well.
     if (resetRequested || resetEnded)
+    {
+        g_nr.reset = true;
         g_nr.preSrQuarantineFrames = kPreSrQuarantineFrames;
+    }
 
     const bool inputChanged =
         g_nr.preSrObservedWidth != observedWidth ||
@@ -2887,6 +2890,10 @@ ID3D12Resource* EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_
         if (havePerfQuality)
             g_nr.preSrObservedPerfQuality = perfQuality;
 
+        // The game reset may have ended while this quarantine was running. Carry the transition
+        // into the NR feature itself so its first post-transition evaluation cannot reuse the old
+        // scene's temporal history.
+        g_nr.reset = true;
         g_nr.preSrAwaitingEvaluation = true;
         g_nr.preSrQuarantineFrames = kPreSrQuarantineFrames;
         ParkNrResource(g_nr.preSrScratch);
