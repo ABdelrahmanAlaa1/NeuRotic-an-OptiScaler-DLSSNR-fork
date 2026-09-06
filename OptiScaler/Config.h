@@ -504,14 +504,15 @@ class Config
 
     // DLSS
     CustomOptional<bool> DLSSEnabled { true };
-    CustomOptional<bool> RenderPresetOverride { false };
+    CustomOptional<bool> RenderPresetOverride { true };
     CustomOptional<uint32_t> RenderPresetForAll { 0 };
     CustomOptional<uint32_t, SoftDefault> RenderPresetDLAA { 0 };
     CustomOptional<uint32_t, SoftDefault> RenderPresetUltraQuality { 0 };
     CustomOptional<uint32_t, SoftDefault> RenderPresetQuality { 0 };
     CustomOptional<uint32_t, SoftDefault> RenderPresetBalanced { 0 };
-    CustomOptional<uint32_t, SoftDefault> RenderPresetPerformance { 0 };
-    CustomOptional<uint32_t, SoftDefault> RenderPresetUltraPerformance { 0 };
+    // Stock release defaults: K for Performance and L for Ultra Performance.
+    CustomOptional<uint32_t, SoftDefault> RenderPresetPerformance { 11 };
+    CustomOptional<uint32_t, SoftDefault> RenderPresetUltraPerformance { 12 };
 
     // DLSSD
     CustomOptional<bool> DLSSDRenderPresetOverride { false };

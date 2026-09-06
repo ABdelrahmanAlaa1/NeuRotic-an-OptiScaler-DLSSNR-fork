@@ -212,7 +212,11 @@ struct NrState
     uint32_t preSrObservedOutHeight = 0;
     DXGI_FORMAT preSrObservedOutFormat = DXGI_FORMAT_UNKNOWN;
     int preSrObservedPerfQuality = -999999;
-    uint32_t preSrStableFrames = 0;
+    // A transition is complete once the new resources/features have been created and one
+    // evaluation has succeeded. This is deliberately readiness-based rather than a fixed number
+    // of rendered frames, so high-refresh systems do not race through an arbitrary settle window.
+    bool preSrAwaitingEvaluation = false;
+    bool preSrResetWasRequested = false;
     NVSDK_NGX_Handle* preDlaaFeature = nullptr;
     ID3D12Resource* preDlaaOutput = nullptr;
     uint32_t preDlaaWidth = 0;
@@ -1747,7 +1751,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             ParkNrResource(g_nr.preSrScratch);
             ParkNrResource(g_nr.preSrRejitter);
             g_nr.preSrScratchPrimed = false;
-            g_nr.preSrStableFrames = 0;
+            g_nr.preSrAwaitingEvaluation = true;
         }
     }
 
@@ -2831,6 +2835,12 @@ ID3D12Resource* EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_
         params->Get(NVSDK_NGX_Parameter_Reset, &resetValue) == NVSDK_NGX_Result_Success &&
         resetValue != 0;
 
+    // Games may hold Reset high for several evaluations. Treat it as a transition event only on
+    // the rising edge; repeatedly parking the same resources while Reset remains high turns a
+    // normal reset into an unnecessary teardown loop.
+    const bool resetEdge = resetRequested && !g_nr.preSrResetWasRequested;
+    g_nr.preSrResetWasRequested = resetRequested;
+
     const bool inputChanged =
         g_nr.preSrObservedWidth != observedWidth ||
         g_nr.preSrObservedHeight != observedHeight ||
@@ -2852,7 +2862,7 @@ ID3D12Resource* EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_
         g_nr.preSrObservedOutWidth == 0 ||
         g_nr.preSrObservedOutHeight == 0;
 
-    if (firstObservation || inputChanged || outputChanged || qualityChanged || resetRequested)
+    if (firstObservation || inputChanged || outputChanged || qualityChanged || resetEdge)
     {
         const int oldQuality = g_nr.preSrObservedPerfQuality;
 
@@ -2866,7 +2876,7 @@ ID3D12Resource* EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_
         if (havePerfQuality)
             g_nr.preSrObservedPerfQuality = perfQuality;
 
-        g_nr.preSrStableFrames = 0;
+        g_nr.preSrAwaitingEvaluation = true;
         ParkNrResource(g_nr.preSrScratch);
         ParkNrResource(g_nr.preSrRejitter);
         g_nr.preSrScratchPrimed = false;
@@ -2874,27 +2884,11 @@ ID3D12Resource* EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_
 
         LOG_WARN("DLSS-NR v10 RAW PRE-SR: DLSS transition detected "
                  "(reset={}, input {}x{}, output {}x{}, quality {} -> {}); "
-                 "raw pre-SR NR is bypassed while NGX settles",
-                 resetRequested ? 1 : 0,
+                 "raw pre-SR NR is bypassed until the new path is ready",
+                 resetEdge ? 1 : 0,
                  observedWidth, observedHeight,
                  observedOutWidth, observedOutHeight,
                  oldQuality, havePerfQuality ? perfQuality : oldQuality);
-
-        device->Release();
-        return nullptr;
-    }
-
-    constexpr uint32_t kPreSrModeSettleFrames = 20;
-    if (g_nr.preSrStableFrames < kPreSrModeSettleFrames)
-    {
-        ++g_nr.preSrStableFrames;
-
-        if (g_nr.preSrStableFrames == kPreSrModeSettleFrames)
-        {
-            LOG_WARN("DLSS-NR v10 RAW PRE-SR: game DLSS mode stable at {}x{} -> {}x{}; "
-                     "raw pre-SR NR initializes next",
-                     observedWidth, observedHeight, observedOutWidth, observedOutHeight);
-        }
 
         device->Release();
         return nullptr;
@@ -2933,6 +2927,7 @@ ID3D12Resource* EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_
         ParkNrResource(g_nr.preSrScratch);
         ParkNrResource(g_nr.preSrRejitter);
         g_nr.preSrScratchPrimed = false;
+        g_nr.preSrAwaitingEvaluation = true;
         g_nr.preSrScratch = CreateScratch(device, colorDesc.Format, observedWidth, observedHeight);
         g_nr.preSrRejitter = CreateScratch(device, colorDesc.Format, observedWidth, observedHeight);
     }
@@ -2978,8 +2973,27 @@ ID3D12Resource* EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_
     if (!featureReadyBefore)
     {
         g_nr.preSrScratchPrimed = true;
+        g_nr.preSrAwaitingEvaluation = true;
         device->Release();
         return nullptr;
+    }
+
+    if (g_nr.failed)
+    {
+        // Do not claim that a transition is ready when the first evaluation failed. The existing
+        // session-failure policy remains authoritative, but keep the readiness state honest for
+        // telemetry and later recovery paths.
+        g_nr.preSrAwaitingEvaluation = true;
+        device->Release();
+        return nullptr;
+    }
+
+    if (g_nr.preSrAwaitingEvaluation)
+    {
+        g_nr.preSrAwaitingEvaluation = false;
+        LOG_WARN("DLSS-NR v10 RAW PRE-SR: new path ready after first successful evaluation at "
+                 "{}x{} -> {}x{}",
+                 observedWidth, observedHeight, observedOutWidth, observedOutHeight);
     }
 
     float jitterX = 0.0f, jitterY = 0.0f;
@@ -3638,7 +3652,8 @@ void Shutdown()
     g_nr.preSrObservedOutHeight = 0;
     g_nr.preSrObservedOutFormat = DXGI_FORMAT_UNKNOWN;
     g_nr.preSrObservedPerfQuality = -999999;
-    g_nr.preSrStableFrames = 0;
+    g_nr.preSrAwaitingEvaluation = false;
+    g_nr.preSrResetWasRequested = false;
 
     if (g_nr.hdrCopy != nullptr)
     {
