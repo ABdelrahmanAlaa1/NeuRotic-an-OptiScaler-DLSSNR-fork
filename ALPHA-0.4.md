@@ -25,12 +25,12 @@ These changes were developed as an experimental Alpha. They are not a replacemen
 
 ## Simple installation
 
-1. Install **Dagger**.
-2. Install **Bows**.
-3. Install **OptiScaler** using its normal installation instructions.
-4. Open this repository's **`alpha-0.4` branch** and download the compiled Alpha 0.4 files when they are provided with the branch/release.
-5. Back up the existing OptiScaler files, then overwrite the matching files in the OptiScaler/game installation directory.
-6. Start the game and open the OptiScaler overlay to review the Neural Rendering and telemetry settings.
+1. Install **OptiScaler** using its normal installation instructions.
+2. Open this repository's **`alpha-0.4` branch** and download the compiled Alpha 0.4 files when they are provided with the branch/release.
+3. Back up the existing OptiScaler files, then overwrite the matching files in the OptiScaler/game installation directory.
+4. Start the game and open the OptiScaler overlay to review the Neural Rendering and telemetry settings.
+
+There are no Dagger or Bows prerequisites. Those names were included in an earlier documentation mistake and are not part of this fork's installation requirements.
 
 If you download the repository source rather than a compiled package, it must be built first; the source tree itself is not a drop-in binary installation.
 
