@@ -373,6 +373,11 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_Init_with_ProjectID(
 NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_Shutdown(void)
 {
     shutdown = true;
+
+    // NR owns a driver feature, borrowed capability parameters, and device-bound scratch resources.
+    // Release them while the native NGX core is still live so a later initialization cannot reuse a
+    // stale generation.
+    DlssNr::Shutdown();
     State::Instance().nvngxDx12Inited = false;
 
     D3D12Device = nullptr;
@@ -826,6 +831,12 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_ReleaseFeature(NVSDK_NGX_Handle* 
     DlssNr::ExposureScan::ReleaseTrackedResources();
 
     auto handleId = InHandle->Id;
+
+    // A replacement can retain the same dimensions and preset.  Treat every native NGX feature
+    // release as a continuity break; the next Pre-SR evaluation will seed privately before output
+    // is eligible for display.
+    if (handleId < DLSS_MOD_ID_OFFSET)
+        DlssNr::NotifyUpscalerRelease();
 
     // Clean up framegen
     if (State::Instance().currentFG != nullptr && State::Instance().activeFgInput == FGInput::Upscaler)

@@ -56,6 +56,10 @@ void RenderMenu(::Config* config, float menuResScale);
 // Clears the session failure latch, so a failure caused by transient thrash does not cost a restart.
 void RetryAfterFailure();
 
+// A native upscaler feature was released.  Its replacement may reuse dimensions, so preserve the
+// interruption explicitly instead of assuming a later size change will invalidate NR history.
+void NotifyUpscalerRelease();
+
 
 // Asks the model whether it will work on Direct3D 11 at all, once, and logs the answer.
 //

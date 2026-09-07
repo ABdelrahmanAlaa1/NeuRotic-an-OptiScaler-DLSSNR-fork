@@ -1025,6 +1025,12 @@ void InvalidateExposureMeter()
 //
 // So a cut snaps and a drift eases. Walking out of a cave is a drift; a camera cut is not, and
 // pretending otherwise to avoid pumping just moves the failure somewhere more visible.
+bool IsSupportedExposureWhitePoint(float exposure, float preExposure, float trim, float& whitePoint)
+{
+    whitePoint = preExposure / exposure * trim;
+    return std::isfinite(whitePoint) && whitePoint >= 0.01f && whitePoint <= 4096.0f;
+}
+
 float ResolveWhitePoint(const Config& cfg, bool isHdrBuffer)
 {
     const float slider = cfg.DlssNrWhitePointScale.value_or_default();
@@ -1086,8 +1092,40 @@ float ResolveWhitePoint(const Config& cfg, bool isHdrBuffer)
         // Their value is left in the config untouched, so switching back to manual restores the
         // number they arrived at. It is only what this path consumes that is limited.
         const float trim = std::clamp(cfg.DlssNrWhitePointTrim.value_or_default(), 0.25f, 4.0f);
+        float fromExposure = 0.0f;
 
-        return std::clamp(g_nr.gamePreExposure / g_nr.gameExposure * trim, 0.01f, 4096.0f);
+        // The limits below were already the range this path claimed to support. Clamping an
+        // out-of-domain sample to an endpoint turns bad metadata into a persistent extreme exposure:
+        // Monster Hunter Wilds supplied 1786 -> 604 with pre-exposure 1 in the failed Test A, pinning
+        // the white point at 0.01 for the entire visible event. Treat saturation as invalid evidence
+        // and use the unchanged manual paper white instead. The host-side live-texture gate below
+        // makes the same decision before the shader is allowed to sample that resource.
+        static bool rejected = false;
+
+        if (IsSupportedExposureWhitePoint(g_nr.gameExposure, g_nr.gamePreExposure, trim,
+                                          fromExposure))
+        {
+            if (rejected)
+            {
+                LOG_INFO("DLSS-NR FLASHBANG exposure guard: live exposure returned in range; "
+                         "exposure {:.6f}, pre-exposure {:.6f}, white point {:.6f}",
+                         g_nr.gameExposure, g_nr.gamePreExposure, fromExposure);
+            }
+
+            rejected = false;
+            return fromExposure;
+        }
+
+        if (!rejected)
+        {
+            LOG_WARN("DLSS-NR FLASHBANG exposure guard: rejected exposure {:.6f} with pre-exposure "
+                     "{:.6f}; derived white point {:.9f} is outside [0.01, 4096], using manual "
+                     "paper white {:.6f}",
+                     g_nr.gameExposure, g_nr.gamePreExposure, fromExposure, slider);
+        }
+
+        rejected = true;
+        return slider;
     }
 
     // Otherwise the slider, and only the slider.
@@ -2026,10 +2064,45 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
 
     if (cfg.DlssNrWhitePointSource.value_or_default() == 1 && frame.ExposureTexture != nullptr)
     {
-        exposureTex = (ID3D12Resource*) frame.ExposureTexture;
-        useGameExposure = 1;
         const float trim = std::clamp(cfg.DlssNrWhitePointTrim.value_or_default(), 0.25f, 4.0f);
-        exposurePreMul = g_nr.gamePreExposure * trim;
+        float liveWhitePoint = 0.0f;
+        const bool liveExposureAccepted =
+            g_nr.gameExposure > 1e-6f &&
+            IsSupportedExposureWhitePoint(g_nr.gameExposure, g_nr.gamePreExposure, trim,
+                                          liveWhitePoint);
+
+        // The shader can sample the current texture with zero latency, but it cannot tell the CPU
+        // what it saw. Use the delayed readback as the semantic admission check: until this resource
+        // has produced an in-domain white point, do not bind it to the live path. Monster Hunter's
+        // 1786 -> 604 sequence therefore stays on the manual paper white from the first frame rather
+        // than spending its first readback-latency frames at the old 0.01 clamp.
+        static bool liveExposureHeld = false;
+
+        if (liveExposureAccepted)
+        {
+            exposureTex = (ID3D12Resource*) frame.ExposureTexture;
+            useGameExposure = 1;
+            exposurePreMul = g_nr.gamePreExposure * trim;
+
+            if (liveExposureHeld)
+            {
+                LOG_INFO("DLSS-NR FLASHBANG exposure guard: enabling live texture after validated "
+                         "white point {:.6f}",
+                         liveWhitePoint);
+            }
+
+            liveExposureHeld = false;
+        }
+        else
+        {
+            if (!liveExposureHeld)
+            {
+                LOG_WARN("DLSS-NR FLASHBANG exposure guard: live texture withheld until its delayed "
+                         "sample proves an in-range white point; using manual paper white");
+            }
+
+            liveExposureHeld = true;
+        }
     }
 
     // Frame hold. Freeze the encode's input so a live setting change re-renders the same frame. This
@@ -2543,6 +2616,30 @@ void RetryAfterFailure()
     g_nr.reason = "";
     g_nr.reset = true;
 
+}
+
+void NotifyUpscalerRelease()
+{
+    std::lock_guard<std::mutex> nrLock(g_nrMutex);
+
+    // A same-size native DLSS recreation is still a temporal discontinuity.  Forget the observed
+    // identity so the next Pre-SR call rebuilds its scratch path, requests an NR history reset, and
+    // withholds the transition rather than resolving a seed frame into the game's Color resource.
+    g_nr.preSrObservedWidth = 0;
+    g_nr.preSrObservedHeight = 0;
+    g_nr.preSrObservedFormat = DXGI_FORMAT_UNKNOWN;
+    g_nr.preSrObservedOutWidth = 0;
+    g_nr.preSrObservedOutHeight = 0;
+    g_nr.preSrObservedOutFormat = DXGI_FORMAT_UNKNOWN;
+    g_nr.preSrObservedPerfQuality = -999999;
+    g_nr.preSrScratchPrimed = false;
+    g_nr.preSrAwaitingEvaluation = true;
+    g_nr.preSrQuarantineFrames = kPreSrQuarantineFrames;
+    g_nr.preSrResetWasRequested = false;
+    g_nr.reset = true;
+
+    LOG_WARN("DLSS-NR v10 RAW PRE-SR: native upscaler feature released; "
+             "quarantining NR until replacement resources evaluate successfully");
 }
 
 struct PreDlaaRetired
@@ -3331,6 +3428,25 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
 
         void* exposureTex = nullptr;
         params->Get(NVSDK_NGX_Parameter_ExposureTexture, &exposureTex);
+
+        // Descriptor evidence is bounded and only emitted when the supplied resource changes. It
+        // tells the next test whether Monster Hunter is actually handing over the documented 1x1
+        // exposure texture/format or another resource whose first channel merely looks numeric.
+        static void* loggedExposureTex = nullptr;
+        static unsigned int exposureDescLogs = 0;
+
+        if (exposureTex != nullptr && exposureTex != loggedExposureTex && exposureDescLogs < 8)
+        {
+            loggedExposureTex = exposureTex;
+            ++exposureDescLogs;
+
+            const D3D12_RESOURCE_DESC desc = ((ID3D12Resource*) exposureTex)->GetDesc();
+            LOG_INFO("DLSS-NR FLASHBANG exposure resource {}: dimension {}, {}x{}, format {}, "
+                     "mips {}, samples {}, layout {}, flags 0x{:X}",
+                     exposureDescLogs, (unsigned int) desc.Dimension, desc.Width, desc.Height,
+                     (unsigned int) desc.Format, desc.MipLevels, desc.SampleDesc.Count,
+                     (unsigned int) desc.Layout, (unsigned int) desc.Flags);
+        }
 
         frame.ExposureTexture = exposureTex;
         frame.PreExposure = havePre && preExposure > 1e-6f ? preExposure : 1.0f;
