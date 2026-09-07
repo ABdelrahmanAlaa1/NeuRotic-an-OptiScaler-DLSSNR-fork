@@ -38,7 +38,6 @@ struct RrDlssPipeline
     std::unique_ptr<DLSSFeatureDx12> finalDlss;
     unsigned int baseWidth = 0;
     unsigned int baseHeight = 0;
-    bool reportedModeMismatch = false;
 };
 
 static std::unordered_map<unsigned int, RrDlssPipeline> RrDlssPipelines;
@@ -193,9 +192,9 @@ static void LogNrPipelineObservation(unsigned int handleId, NVSDK_NGX_Feature fe
     LOG_INFO("DLSS-NR Test 1.0: handle {} feature {} input {}x{} output {}x{}; placement {}{}",
               handleId, rr ? "Ray Reconstruction" : "Super Resolution",
               observed.inputWidth, observed.inputHeight, observed.outputWidth, observed.outputHeight,
-              observed.rrDlss ? "RR -> NR -> DLSS SR" :
+              observed.rrDlss ? (performanceMode ? "RR -> NR -> DLSS SR" : "RR -> DLSS SR -> NR") :
               (observed.preSr ? "NR -> SR" : (rr ? "RR -> NR" : "SR -> NR")),
-              rr && performanceMode && !observed.rrDlss ? " (restart required for Performance route)" : "");
+              rr && !observed.rrDlss ? " (base-resolution RR pipeline unavailable)" : "");
 }
 
 static int evalCounter = 0;
@@ -827,11 +826,10 @@ static NVSDK_NGX_Result TryCreateOptiFeature(ID3D12GraphicsCommandList* InCmdLis
     void* originalOutput = nullptr;
     unsigned int originalOutWidth = 0;
     unsigned int originalOutHeight = 0;
-    bool rrPerformancePrepared = false;
+    bool rrPipelinePrepared = false;
     RrDlssPipeline pendingRrPipeline {};
 
-    if (InFeatureID == NVSDK_NGX_Feature_RayReconstruction && cfg.DlssNrRunBeforeSr.value_or_default() &&
-        InParameters != nullptr &&
+    if (InFeatureID == NVSDK_NGX_Feature_RayReconstruction && InParameters != nullptr &&
         InParameters->Get(NVSDK_NGX_Parameter_Color, &originalColor) == NVSDK_NGX_Result_Success &&
         InParameters->Get(NVSDK_NGX_Parameter_Output, &originalOutput) == NVSDK_NGX_Result_Success &&
         InParameters->Get(NVSDK_NGX_Parameter_OutWidth, &originalOutWidth) == NVSDK_NGX_Result_Success &&
@@ -848,8 +846,8 @@ static NVSDK_NGX_Result TryCreateOptiFeature(ID3D12GraphicsCommandList* InCmdLis
             InParameters->Set(NVSDK_NGX_Parameter_Output, pendingRrPipeline.rrBaseOutput.Get());
             InParameters->Set(NVSDK_NGX_Parameter_OutWidth, pendingRrPipeline.baseWidth);
             InParameters->Set(NVSDK_NGX_Parameter_OutHeight, pendingRrPipeline.baseHeight);
-            rrPerformancePrepared = true;
-            LOG_INFO("DLSS-NR Test 1.0: creating RR at {}x{} before NR and native DLSS SR to {}x{}",
+            rrPipelinePrepared = true;
+            LOG_INFO("DLSS-NR Test 1.0: creating base RR at {}x{} before native DLSS SR to {}x{}",
                      pendingRrPipeline.baseWidth, pendingRrPipeline.baseHeight, originalOutWidth, originalOutHeight);
         }
     }
@@ -886,7 +884,7 @@ static NVSDK_NGX_Result TryCreateOptiFeature(ID3D12GraphicsCommandList* InCmdLis
     {
         LOG_ERROR("Failed to retrieve feature implementation for '{}'", UpscalerDisplayName(upscalerBackend));
 
-        if (rrPerformancePrepared)
+        if (rrPipelinePrepared)
         {
             InParameters->Set(NVSDK_NGX_Parameter_Output, originalOutput);
             InParameters->Set(NVSDK_NGX_Parameter_OutWidth, originalOutWidth);
@@ -913,14 +911,14 @@ static NVSDK_NGX_Result TryCreateOptiFeature(ID3D12GraphicsCommandList* InCmdLis
     // against the game's original output immediately afterwards, using the same native inputs.
     const bool featureInitialized = feature->Init(D3D12Device, InCmdList, InParameters);
 
-    if (rrPerformancePrepared)
+    if (rrPipelinePrepared)
     {
         InParameters->Set(NVSDK_NGX_Parameter_Output, originalOutput);
         InParameters->Set(NVSDK_NGX_Parameter_OutWidth, originalOutWidth);
         InParameters->Set(NVSDK_NGX_Parameter_OutHeight, originalOutHeight);
     }
 
-    if (featureInitialized && rrPerformancePrepared)
+    if (featureInitialized && rrPipelinePrepared)
     {
         InParameters->Set(NVSDK_NGX_Parameter_Color, pendingRrPipeline.rrBaseOutput.Get());
         pendingRrPipeline.finalDlss =
@@ -930,14 +928,15 @@ static NVSDK_NGX_Result TryCreateOptiFeature(ID3D12GraphicsCommandList* InCmdLis
 
         if (!dlssInitialized)
         {
-            LOG_ERROR("DLSS-NR Test 1.0: native final DLSS SR creation failed; rejecting RR Performance pipeline");
+            LOG_ERROR("DLSS-NR Test 1.0: native final DLSS SR creation failed; rejecting RR routing pipeline");
             Dx12Contexts.erase(handleId);
             D3D12Hooks::SetRootSignatureTracking(true);
             return NVSDK_NGX_Result_Fail;
         }
 
         RrDlssPipelines[handleId] = std::move(pendingRrPipeline);
-        LOG_INFO("DLSS-NR Test 1.0: RR -> base-resolution NR -> native DLSS SR pipeline ready");
+        LOG_INFO("DLSS-NR Test 1.0: dual route ready: Performance ON = RR -> NR -> DLSS SR; "
+                 "OFF = RR -> DLSS SR -> NR");
     }
 
     // Initialize feature
@@ -1463,12 +1462,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
     if (isRayReconstruction && hasRrDlssPipeline)
     {
         auto& pipeline = rrPipelineIt->second;
-        if (!cfg.DlssNrRunBeforeSr.value_or_default() && !pipeline.reportedModeMismatch)
-        {
-            pipeline.reportedModeMismatch = true;
-            LOG_WARN("DLSS-NR Test 1.0: Performance Mode changed after RR creation; keeping the created "
-                     "RR -> base NR -> DLSS route until restart");
-        }
+        const bool performanceMode = cfg.DlssNrRunBeforeSr.value_or_default();
 
         void* originalColor = nullptr;
         void* originalOutput = nullptr;
@@ -1487,16 +1481,21 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
 
         if (rrResult == NVSDK_NGX_Result_Success)
         {
-            // RR has now written its base-resolution result. NR edits that result in place before
-            // the separate native DLSS feature performs the only final upscale.
-            DlssNr::EvaluateAfterUpscale(InCmdList, InParameters, nullptr, true);
+            // RR always writes a base-resolution result. Performance Mode changes only which side
+            // of the separate native DLSS upscale receives NR.
+            if (performanceMode)
+                DlssNr::EvaluateAfterUpscale(InCmdList, InParameters, nullptr, true);
+
             InParameters->Set(NVSDK_NGX_Parameter_Color, pipeline.rrBaseOutput.Get());
             InParameters->Set(NVSDK_NGX_Parameter_Output, originalOutput);
             InParameters->Set(NVSDK_NGX_Parameter_OutWidth, originalOutWidth);
             InParameters->Set(NVSDK_NGX_Parameter_OutHeight, originalOutHeight);
 
-            if (!pipeline.finalDlss->Evaluate(InCmdList, InParameters))
+            const bool dlssResult = pipeline.finalDlss->Evaluate(InCmdList, InParameters);
+            if (!dlssResult)
                 LOG_ERROR("DLSS-NR Test 1.0: final native DLSS SR evaluation failed");
+            else if (!performanceMode)
+                DlssNr::EvaluateAfterUpscale(InCmdList, InParameters, nullptr, true);
         }
 
         InParameters->Set(NVSDK_NGX_Parameter_Color, originalColor);
@@ -1507,13 +1506,13 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
         return rrResult;
     }
 
-    if (isRayReconstruction && cfg.DlssNrRunBeforeSr.value_or_default())
+    if (isRayReconstruction)
     {
-        static bool saidRrRestart = false;
-        if (!saidRrRestart)
+        static bool saidRrPipelineUnavailable = false;
+        if (!saidRrPipelineUnavailable)
         {
-            saidRrRestart = true;
-            LOG_WARN("DLSS-NR Test 1.0: RR was created without the Performance pipeline; restart is required");
+            saidRrPipelineUnavailable = true;
+            LOG_WARN("DLSS-NR Test 1.0: RR base-resolution pipeline was unavailable; using the control path");
         }
     }
 
