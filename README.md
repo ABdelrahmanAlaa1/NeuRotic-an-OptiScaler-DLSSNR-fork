@@ -22,7 +22,7 @@ The upstream fork already provided experimental direct access to NVIDIA DLSS Neu
 
 Downloads:
 
-- [Latest release — v0.6.1](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases/tag/v0.6.1-padded-presr) — complete package with the padded pre-SR fix, earlier skin/MFG compatibility changes and the verified FG downloader. Build/GPU-copy tested; Dawnwalker validation is pending. NVIDIA NR/FG runtimes are not bundled.
+- [Latest release — v0.6.2](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases/tag/v0.6.2-swapchain-fixes) — rebuilt complete package including janblade's window-sized swapchain fix and the reviewed DirectComposition hook, plus the previous padded pre-SR and skin/MFG changes. Build and native API smoke-tested; in-game validation of the new hooks is pending. NVIDIA NR/FG runtimes are not bundled.
 - [Per-pass controls preview](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases/tag/v0.5.0-pass-controls-preview) — reorganized pass sections and independent model strengths, including the RR controls. Runtime validation is pending.
 - [Native RR controls preview](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases/tag/v0.4.0-rr-preview) — compiled experimental build with independent NR-after-RR controls. In-game RR/NR validation is pending.
 - [Portable cross-generation package](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases/tag/v0.3.0-crossgen-portable) — the complete installer and backend layout, with game-neutral defaults and RTX 20/30/40/50 runtime guidance.
@@ -61,9 +61,9 @@ release. This supplies dependencies, not a guarantee of injected FG compatibilit
 
 ### New compatibility work (not yet game-validated)
 
-- Source newer than v0.6.1 incorporates janblade's NBA 2K26 window-sized swapchain fix, diagnostic
+- v0.6.2 incorporates janblade's NBA 2K26 window-sized swapchain fix, diagnostic
   logging and a reviewed DirectComposition hook. [Review and validation](docs/PR-2-REVIEW.md).
-  The existing v0.6.1 ZIP does not contain these changes.
+  These changes are included in the v0.6.2 ZIP; the historical v0.6.1 ZIP is unchanged.
 - Padded pre-SR colour inputs, including the reported 2558x1439-in-2560x1440 case, no longer fall
   back to 4K NR merely because the allocation is larger. [Details and testing](docs/PADDED-PRESR.md).
 - Optional skin-colour protection with separate skin/environment lighting and colour controls.

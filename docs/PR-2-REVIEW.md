@@ -50,3 +50,4 @@ x64\dxgi_window_size_smoke.exe
 
 The promoted v0.6.1 release retains its original binaries; this later source change requires a new
 build. Promotion to release status does not imply additional Dawnwalker or NBA 2K26 game testing.
+The subsequent v0.6.2 release supplies that rebuilt package, including both reviewed fixes.
