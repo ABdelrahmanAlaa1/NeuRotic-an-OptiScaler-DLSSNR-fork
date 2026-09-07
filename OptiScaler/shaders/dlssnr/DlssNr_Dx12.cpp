@@ -3296,7 +3296,7 @@ ID3D12Resource* EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_
 // reprojection stage, a frame generation path, anything that is not the upscaler seam -- calls
 // RunPass directly and never touches an NGX parameter block.
 void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,
-                          ID3D12CommandQueue* timingQueue, bool forceForPreSrScratch)
+                          ID3D12CommandQueue* timingQueue, bool forceAfterUpscale)
 {
     if (!Config::Instance()->DlssNrEnabled.value_or_default())
     {
@@ -3310,9 +3310,10 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
         return;
     }
 
-    // In pre-SR mode the ordinary call site after DLSS must not run NR a second time.
-    // EvaluateBeforeUpscale explicitly forces this function only while Output points at our scratch.
-    if (Config::Instance()->DlssNrRunBeforeSr.value_or_default() && !forceForPreSrScratch)
+    // In pre-SR mode the ordinary call site after Super Resolution must not run NR a second time.
+    // EvaluateBeforeUpscale forces this function while Output points at its scratch. Ray Reconstruction
+    // also forces it: RR must keep its original inputs even when Performance Mode is selected.
+    if (Config::Instance()->DlssNrRunBeforeSr.value_or_default() && !forceAfterUpscale)
         return;
 
     // Which of the game's APIs this evaluate arrived through.
@@ -3388,7 +3389,7 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
         frame.JitterY = 0.0f;
     }
 
-    if (forceForPreSrScratch)
+    if (forceAfterUpscale && target == g_nr.preSrScratch)
     {
         static bool saidJitter = false;
         static bool saidMissingJitter = false;

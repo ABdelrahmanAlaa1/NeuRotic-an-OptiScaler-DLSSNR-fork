@@ -40,7 +40,7 @@ void RestoreAfterUpscale(NVSDK_NGX_Parameter* params);
 
 void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,
                           ID3D12CommandQueue* timingQueue = nullptr,
-                          bool forceForPreSrScratch = false);
+                          bool forceAfterUpscale = false);
 
 
 

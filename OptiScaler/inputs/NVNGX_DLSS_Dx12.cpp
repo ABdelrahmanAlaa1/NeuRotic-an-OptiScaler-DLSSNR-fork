@@ -30,6 +30,70 @@
 static ankerl::unordered_dense::map<unsigned int, ContextData<IFeature_Dx12>> Dx12Contexts;
 static std::unordered_map<unsigned int, NVSDK_NGX_Feature> HandleToFeature;
 
+static bool IsNrPipelineFeature(NVSDK_NGX_Feature feature)
+{
+    return feature == NVSDK_NGX_Feature_SuperSampling ||
+           feature == NVSDK_NGX_Feature_RayReconstruction;
+}
+
+// Log pipeline identity only when it changes. This is intentionally handle-scoped: a secondary
+// viewport must not overwrite the main viewport's evidence merely because it evaluated later.
+struct NrPipelineObservation
+{
+    NVSDK_NGX_Feature feature = (NVSDK_NGX_Feature) 0;
+    bool preSr = false;
+    unsigned int inputWidth = 0;
+    unsigned int inputHeight = 0;
+    unsigned int outputWidth = 0;
+    unsigned int outputHeight = 0;
+};
+
+static std::unordered_map<unsigned int, NrPipelineObservation> NrPipelineObservations;
+
+static void LogNrPipelineObservation(unsigned int handleId, NVSDK_NGX_Feature feature,
+                                     NVSDK_NGX_Parameter* params, bool performanceMode)
+{
+    if (!IsNrPipelineFeature(feature) || params == nullptr)
+        return;
+
+    void* color = nullptr;
+    void* output = nullptr;
+    params->Get(NVSDK_NGX_Parameter_Color, &color);
+    params->Get(NVSDK_NGX_Parameter_Output, &output);
+
+    NrPipelineObservation observed {};
+    observed.feature = feature;
+    observed.preSr = feature == NVSDK_NGX_Feature_SuperSampling && performanceMode;
+
+    if (color != nullptr)
+    {
+        const auto desc = static_cast<ID3D12Resource*>(color)->GetDesc();
+        observed.inputWidth = static_cast<unsigned int>(desc.Width);
+        observed.inputHeight = desc.Height;
+    }
+    if (output != nullptr)
+    {
+        const auto desc = static_cast<ID3D12Resource*>(output)->GetDesc();
+        observed.outputWidth = static_cast<unsigned int>(desc.Width);
+        observed.outputHeight = desc.Height;
+    }
+
+    const auto it = NrPipelineObservations.find(handleId);
+    if (it != NrPipelineObservations.end() && it->second.feature == observed.feature &&
+        it->second.preSr == observed.preSr && it->second.inputWidth == observed.inputWidth &&
+        it->second.inputHeight == observed.inputHeight && it->second.outputWidth == observed.outputWidth &&
+        it->second.outputHeight == observed.outputHeight)
+        return;
+
+    NrPipelineObservations[handleId] = observed;
+    const bool rr = feature == NVSDK_NGX_Feature_RayReconstruction;
+    LOG_INFO("DLSS-NR Test 0.9: handle {} feature {} input {}x{} output {}x{}; placement {}{}",
+             handleId, rr ? "Ray Reconstruction" : "Super Resolution",
+             observed.inputWidth, observed.inputHeight, observed.outputWidth, observed.outputHeight,
+             observed.preSr ? "NR -> SR" : (rr ? "RR -> NR" : "SR -> NR"),
+             rr && performanceMode ? " (Performance Mode RR compatibility override)" : "");
+}
+
 static ID3D12Device* D3D12Device = nullptr;
 static int evalCounter = 0;
 static bool shutdown = false;
@@ -832,10 +896,16 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_ReleaseFeature(NVSDK_NGX_Handle* 
 
     auto handleId = InHandle->Id;
 
-    // A replacement can retain the same dimensions and preset.  Treat every native NGX feature
-    // release as a continuity break; the next Pre-SR evaluation will seed privately before output
-    // is eligible for display.
-    if (handleId < DLSS_MOD_ID_OFFSET)
+    const auto featureIt = HandleToFeature.find(handleId);
+    const NVSDK_NGX_Feature releasedFeature =
+        featureIt != HandleToFeature.end() ? featureIt->second : (NVSDK_NGX_Feature) 0;
+    NrPipelineObservations.erase(handleId);
+    if (featureIt != HandleToFeature.end())
+        HandleToFeature.erase(featureIt);
+
+    // A replacement can retain the same dimensions and preset. Treat release of either feature
+    // that owns the NR seam as a continuity break; unrelated NGX features must not perturb NR.
+    if (handleId < DLSS_MOD_ID_OFFSET && IsNrPipelineFeature(releasedFeature))
         DlssNr::NotifyUpscalerRelease();
 
     // Clean up framegen
@@ -1123,7 +1193,17 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
     const State& state = State::Instance();
     const Config& cfg = *Config::Instance();
 
-    auto feature = HandleToFeature[handleId];
+    const auto featureIt = HandleToFeature.find(handleId);
+    if (featureIt == HandleToFeature.end())
+    {
+        LOG_WARN("EvaluateFeature received untracked handle {}; NR is not attached", handleId);
+    }
+    const NVSDK_NGX_Feature feature =
+        featureIt != HandleToFeature.end() ? featureIt->second : (NVSDK_NGX_Feature) 0;
+    const bool isNrPipelineFeature = IsNrPipelineFeature(feature);
+    const bool isSuperResolution = feature == NVSDK_NGX_Feature_SuperSampling;
+    const bool isRayReconstruction = feature == NVSDK_NGX_Feature_RayReconstruction;
+    LogNrPipelineObservation(handleId, feature, InParameters, cfg.DlssNrRunBeforeSr.value_or_default());
     static size_t evalWithoutFG = 0;
     bool fgCreated = std::any_of(HandleToFeature.begin(), HandleToFeature.end(),
                                  [](const auto& pair) { return pair.second == NVSDK_NGX_Feature_FrameGeneration; });
@@ -1168,7 +1248,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
         {
             LOG_DEBUG("Passthrough to native DLSS EvaluateFeature for handle {}", handleId);
 
-            if (feature != NVSDK_NGX_Feature_FrameGeneration)
+            if (isSuperResolution)
                 DlssNr::EvaluateBeforeUpscale(InCmdList, InParameters);
 
             NVSDK_NGX_Result result =
@@ -1183,8 +1263,8 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
             // rendered frame. The feature check is the point: frame generation is handed depth and
             // motion vectors too, and its handle can reach here because the branch above does not
             // return, so filtering on the parameter block alone would run the model twice a frame.
-            if (result == NVSDK_NGX_Result_Success && feature != NVSDK_NGX_Feature_FrameGeneration)
-                DlssNr::EvaluateAfterUpscale(InCmdList, InParameters);
+            if (result == NVSDK_NGX_Result_Success && isNrPipelineFeature)
+                DlssNr::EvaluateAfterUpscale(InCmdList, InParameters, nullptr, isRayReconstruction);
 
             return result;
         }
@@ -1207,7 +1287,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
         InParameters->Set("DLSSG.CameraFar", lastDlssgCameraFar.value());
 
     // OptiScaler internal handling
-    if (feature != NVSDK_NGX_Feature_FrameGeneration)
+    if (isSuperResolution)
         DlssNr::EvaluateBeforeUpscale(InCmdList, InParameters);
 
     const NVSDK_NGX_Result optiResult =
@@ -1216,8 +1296,8 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
     DlssNr::RestoreAfterUpscale(InParameters);
 
     // Same pass, for OptiScaler's own upscalers rather than native DLSS.
-    if (optiResult == NVSDK_NGX_Result_Success && feature != NVSDK_NGX_Feature_FrameGeneration)
-        DlssNr::EvaluateAfterUpscale(InCmdList, InParameters);
+    if (optiResult == NVSDK_NGX_Result_Success && isNrPipelineFeature)
+        DlssNr::EvaluateAfterUpscale(InCmdList, InParameters, nullptr, isRayReconstruction);
 
     return optiResult;
 }
