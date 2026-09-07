@@ -28,6 +28,12 @@ There are no Dagger or Bows prerequisites. Those names were included in an earli
 
 If you download the repository source instead of the release package, it must be built first; the source tree is not a drop-in binary installation.
 
+### Source archive versus install package
+
+GitHub also provides automatic `Source code (zip)` and `Source code (tar.gz)` downloads. Those archives contain the development source and generic OptiScaler setup scripts; they are not the NeuRotic install package. Do not run `setup_windows.bat` from the source archive.
+
+The setup script is generic rather than Monster Hunter Wilds-specific: it works in the folder where you extracted a compiled OptiScaler package, asks which proxy filename to use, and supports different game layouts. The Alpha release package is the intended download for normal users.
+
 ## Links
 
 - [NeuRotic Alpha 0.4 branch](https://github.com/MagicalPrincessUnicorn/NeuRotic-an-OptiScaler-DLSSNR-fork/tree/alpha-0.4)
