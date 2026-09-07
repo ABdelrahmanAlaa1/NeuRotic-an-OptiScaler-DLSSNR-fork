@@ -61,6 +61,11 @@ release. This supplies dependencies, not a guarantee of injected FG compatibilit
 
 ### New compatibility work (not yet game-validated)
 
+- Experimental source after v0.6.2: **Generate before SR, apply after SR (DLSS)** runs NR on a private
+  render-size copy, upscales its signed contribution through a separate NVIDIA DLSS feature and applies
+  it to the clean upscaled frame. [Setup, encoding and validation limits](docs/DEFERRED-NR-DLSS.md).
+  This is not in the existing v0.6.2 download and is not yet game-validated.
+
 - v0.6.2 incorporates janblade's NBA 2K26 window-sized swapchain fix, diagnostic
   logging and a reviewed DirectComposition hook. [Review and validation](docs/PR-2-REVIEW.md).
   These changes are included in the v0.6.2 ZIP; the historical v0.6.1 ZIP is unchanged.
