@@ -23,12 +23,51 @@
 
 #include <dxgi1_4.h>
 #include <shared_mutex>
+#include <wrl/client.h>
 #include "detours/detours.h"
 #include <ankerl/unordered_dense.h>
 #include <misc/IdentifyGpu.h>
 
 static ankerl::unordered_dense::map<unsigned int, ContextData<IFeature_Dx12>> Dx12Contexts;
 static std::unordered_map<unsigned int, NVSDK_NGX_Feature> HandleToFeature;
+static ID3D12Device* D3D12Device = nullptr;
+
+struct RrDlssPipeline
+{
+    Microsoft::WRL::ComPtr<ID3D12Resource> rrBaseOutput;
+    std::unique_ptr<DLSSFeatureDx12> finalDlss;
+    unsigned int baseWidth = 0;
+    unsigned int baseHeight = 0;
+    bool reportedModeMismatch = false;
+};
+
+static std::unordered_map<unsigned int, RrDlssPipeline> RrDlssPipelines;
+
+static bool CreateRrBaseOutput(ID3D12Resource* color, ID3D12Resource* fullOutput,
+                               Microsoft::WRL::ComPtr<ID3D12Resource>& baseOutput)
+{
+    if (D3D12Device == nullptr || color == nullptr || fullOutput == nullptr)
+        return false;
+
+    const auto colorDesc = color->GetDesc();
+    auto outputDesc = fullOutput->GetDesc();
+    outputDesc.Width = colorDesc.Width;
+    outputDesc.Height = colorDesc.Height;
+    outputDesc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+    const D3D12_HEAP_PROPERTIES heapProperties { D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+                                                  D3D12_MEMORY_POOL_UNKNOWN, 1, 1 };
+    const HRESULT result = D3D12Device->CreateCommittedResource(
+        &heapProperties, D3D12_HEAP_FLAG_NONE, &outputDesc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+        IID_PPV_ARGS(&baseOutput));
+    if (FAILED(result))
+    {
+        LOG_ERROR("DLSS-NR Test 1.0: RR base-output allocation failed: 0x{:X}", static_cast<uint32_t>(result));
+        return false;
+    }
+
+    return true;
+}
 
 static const char* NgxFeatureName(NVSDK_NGX_Feature feature)
 {
@@ -102,6 +141,7 @@ struct NrPipelineObservation
 {
     NVSDK_NGX_Feature feature = (NVSDK_NGX_Feature) 0;
     bool preSr = false;
+    bool rrDlss = false;
     unsigned int inputWidth = 0;
     unsigned int inputHeight = 0;
     unsigned int outputWidth = 0;
@@ -124,6 +164,8 @@ static void LogNrPipelineObservation(unsigned int handleId, NVSDK_NGX_Feature fe
     NrPipelineObservation observed {};
     observed.feature = feature;
     observed.preSr = feature == NVSDK_NGX_Feature_SuperSampling && performanceMode;
+    observed.rrDlss = feature == NVSDK_NGX_Feature_RayReconstruction &&
+                      RrDlssPipelines.find(handleId) != RrDlssPipelines.end();
 
     if (color != nullptr)
     {
@@ -140,21 +182,22 @@ static void LogNrPipelineObservation(unsigned int handleId, NVSDK_NGX_Feature fe
 
     const auto it = NrPipelineObservations.find(handleId);
     if (it != NrPipelineObservations.end() && it->second.feature == observed.feature &&
-        it->second.preSr == observed.preSr && it->second.inputWidth == observed.inputWidth &&
+        it->second.preSr == observed.preSr && it->second.rrDlss == observed.rrDlss &&
+        it->second.inputWidth == observed.inputWidth &&
         it->second.inputHeight == observed.inputHeight && it->second.outputWidth == observed.outputWidth &&
         it->second.outputHeight == observed.outputHeight)
         return;
 
     NrPipelineObservations[handleId] = observed;
     const bool rr = feature == NVSDK_NGX_Feature_RayReconstruction;
-    LOG_INFO("DLSS-NR Test 0.9: handle {} feature {} input {}x{} output {}x{}; placement {}{}",
-             handleId, rr ? "Ray Reconstruction" : "Super Resolution",
-             observed.inputWidth, observed.inputHeight, observed.outputWidth, observed.outputHeight,
-             observed.preSr ? "NR -> SR" : (rr ? "RR -> NR" : "SR -> NR"),
-             rr && performanceMode ? " (Performance Mode RR compatibility override)" : "");
+    LOG_INFO("DLSS-NR Test 1.0: handle {} feature {} input {}x{} output {}x{}; placement {}{}",
+              handleId, rr ? "Ray Reconstruction" : "Super Resolution",
+              observed.inputWidth, observed.inputHeight, observed.outputWidth, observed.outputHeight,
+              observed.rrDlss ? "RR -> NR -> DLSS SR" :
+              (observed.preSr ? "NR -> SR" : (rr ? "RR -> NR" : "SR -> NR")),
+              rr && performanceMode && !observed.rrDlss ? " (restart required for Performance route)" : "");
 }
 
-static ID3D12Device* D3D12Device = nullptr;
 static int evalCounter = 0;
 static bool shutdown = false;
 static bool _skipInit = false;
@@ -774,6 +817,43 @@ static NVSDK_NGX_Result TryCreateOptiFeature(ID3D12GraphicsCommandList* InCmdLis
     const uint32_t handleId = IFeature::GetNextHandleId();
     LOG_INFO("Creating OptiScaler feature, HandleId: {}", handleId);
 
+    if (!EnsureD3D12Device(InCmdList))
+    {
+        LOG_ERROR("Failed to acquire D3D12 device");
+        return NVSDK_NGX_Result_Fail;
+    }
+
+    void* originalColor = nullptr;
+    void* originalOutput = nullptr;
+    unsigned int originalOutWidth = 0;
+    unsigned int originalOutHeight = 0;
+    bool rrPerformancePrepared = false;
+    RrDlssPipeline pendingRrPipeline {};
+
+    if (InFeatureID == NVSDK_NGX_Feature_RayReconstruction && cfg.DlssNrRunBeforeSr.value_or_default() &&
+        InParameters != nullptr &&
+        InParameters->Get(NVSDK_NGX_Parameter_Color, &originalColor) == NVSDK_NGX_Result_Success &&
+        InParameters->Get(NVSDK_NGX_Parameter_Output, &originalOutput) == NVSDK_NGX_Result_Success &&
+        InParameters->Get(NVSDK_NGX_Parameter_OutWidth, &originalOutWidth) == NVSDK_NGX_Result_Success &&
+        InParameters->Get(NVSDK_NGX_Parameter_OutHeight, &originalOutHeight) == NVSDK_NGX_Result_Success &&
+        originalColor != nullptr && originalOutput != nullptr)
+    {
+        const auto colorDesc = static_cast<ID3D12Resource*>(originalColor)->GetDesc();
+        pendingRrPipeline.baseWidth = static_cast<unsigned int>(colorDesc.Width);
+        pendingRrPipeline.baseHeight = colorDesc.Height;
+
+        if (CreateRrBaseOutput(static_cast<ID3D12Resource*>(originalColor),
+                              static_cast<ID3D12Resource*>(originalOutput), pendingRrPipeline.rrBaseOutput))
+        {
+            InParameters->Set(NVSDK_NGX_Parameter_Output, pendingRrPipeline.rrBaseOutput.Get());
+            InParameters->Set(NVSDK_NGX_Parameter_OutWidth, pendingRrPipeline.baseWidth);
+            InParameters->Set(NVSDK_NGX_Parameter_OutHeight, pendingRrPipeline.baseHeight);
+            rrPerformancePrepared = true;
+            LOG_INFO("DLSS-NR Test 1.0: creating RR at {}x{} before NR and native DLSS SR to {}x{}",
+                     pendingRrPipeline.baseWidth, pendingRrPipeline.baseHeight, originalOutWidth, originalOutHeight);
+        }
+    }
+
     // Determine backend name
     Upscaler upscalerBackend;
     if (InFeatureID == NVSDK_NGX_Feature_SuperSampling)
@@ -806,20 +886,15 @@ static NVSDK_NGX_Result TryCreateOptiFeature(ID3D12GraphicsCommandList* InCmdLis
     {
         LOG_ERROR("Failed to retrieve feature implementation for '{}'", UpscalerDisplayName(upscalerBackend));
 
-        D3D12Hooks::SetRootSignatureTracking(true);
-
-        Dx12Contexts.erase(handleId);
-        return NVSDK_NGX_Result_Fail;
-    }
-
-    // Ensure D3D12 device
-    if (!EnsureD3D12Device(InCmdList))
-    {
-        LOG_ERROR("Failed to acquire D3D12 device");
+        if (rrPerformancePrepared)
+        {
+            InParameters->Set(NVSDK_NGX_Parameter_Output, originalOutput);
+            InParameters->Set(NVSDK_NGX_Parameter_OutWidth, originalOutWidth);
+            InParameters->Set(NVSDK_NGX_Parameter_OutHeight, originalOutHeight);
+        }
 
         D3D12Hooks::SetRootSignatureTracking(true);
 
-        // Partial cleanup � handle is allocated but context is incomplete
         Dx12Contexts.erase(handleId);
         return NVSDK_NGX_Result_Fail;
     }
@@ -834,8 +909,39 @@ static NVSDK_NGX_Result TryCreateOptiFeature(ID3D12GraphicsCommandList* InCmdLis
 
     IFeature_Dx12* feature = Dx12Contexts[handleId].feature.get();
 
+    // Initialize RR against its base-resolution target first. The final DLSS feature is created
+    // against the game's original output immediately afterwards, using the same native inputs.
+    const bool featureInitialized = feature->Init(D3D12Device, InCmdList, InParameters);
+
+    if (rrPerformancePrepared)
+    {
+        InParameters->Set(NVSDK_NGX_Parameter_Output, originalOutput);
+        InParameters->Set(NVSDK_NGX_Parameter_OutWidth, originalOutWidth);
+        InParameters->Set(NVSDK_NGX_Parameter_OutHeight, originalOutHeight);
+    }
+
+    if (featureInitialized && rrPerformancePrepared)
+    {
+        InParameters->Set(NVSDK_NGX_Parameter_Color, pendingRrPipeline.rrBaseOutput.Get());
+        pendingRrPipeline.finalDlss =
+            std::make_unique<DLSSFeatureDx12>(IFeature::GetNextHandleId(), InParameters);
+        const bool dlssInitialized = pendingRrPipeline.finalDlss->Init(D3D12Device, InCmdList, InParameters);
+        InParameters->Set(NVSDK_NGX_Parameter_Color, originalColor);
+
+        if (!dlssInitialized)
+        {
+            LOG_ERROR("DLSS-NR Test 1.0: native final DLSS SR creation failed; rejecting RR Performance pipeline");
+            Dx12Contexts.erase(handleId);
+            D3D12Hooks::SetRootSignatureTracking(true);
+            return NVSDK_NGX_Result_Fail;
+        }
+
+        RrDlssPipelines[handleId] = std::move(pendingRrPipeline);
+        LOG_INFO("DLSS-NR Test 1.0: RR -> base-resolution NR -> native DLSS SR pipeline ready");
+    }
+
     // Initialize feature
-    if (feature->Init(D3D12Device, InCmdList, InParameters))
+    if (featureInitialized)
     {
         state.currentFeature = feature;
         evalCounter = 0;
@@ -964,6 +1070,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_ReleaseFeature(NVSDK_NGX_Handle* 
         featureIt != HandleToFeature.end() ? featureIt->second : (NVSDK_NGX_Feature) 0;
     NrPipelineObservations.erase(handleId);
     NgxEvaluationTraceObservations.erase(handleId);
+    RrDlssPipelines.erase(handleId);
     if (featureIt != HandleToFeature.end())
         HandleToFeature.erase(featureIt);
 
@@ -1267,6 +1374,8 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
     const bool isNrPipelineFeature = IsNrPipelineFeature(feature);
     const bool isSuperResolution = feature == NVSDK_NGX_Feature_SuperSampling;
     const bool isRayReconstruction = feature == NVSDK_NGX_Feature_RayReconstruction;
+    auto rrPipelineIt = RrDlssPipelines.find(handleId);
+    const bool hasRrDlssPipeline = rrPipelineIt != RrDlssPipelines.end();
     LogNgxEvaluationTrace(handleId, featureIt != HandleToFeature.end(), feature);
     LogNrPipelineObservation(handleId, feature, InParameters, cfg.DlssNrRunBeforeSr.value_or_default());
     static size_t evalWithoutFG = 0;
@@ -1350,6 +1459,63 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
 
     if (lastDlssgCameraFar.has_value())
         InParameters->Set("DLSSG.CameraFar", lastDlssgCameraFar.value());
+
+    if (isRayReconstruction && hasRrDlssPipeline)
+    {
+        auto& pipeline = rrPipelineIt->second;
+        if (!cfg.DlssNrRunBeforeSr.value_or_default() && !pipeline.reportedModeMismatch)
+        {
+            pipeline.reportedModeMismatch = true;
+            LOG_WARN("DLSS-NR Test 1.0: Performance Mode changed after RR creation; keeping the created "
+                     "RR -> base NR -> DLSS route until restart");
+        }
+
+        void* originalColor = nullptr;
+        void* originalOutput = nullptr;
+        unsigned int originalOutWidth = 0;
+        unsigned int originalOutHeight = 0;
+        InParameters->Get(NVSDK_NGX_Parameter_Color, &originalColor);
+        InParameters->Get(NVSDK_NGX_Parameter_Output, &originalOutput);
+        InParameters->Get(NVSDK_NGX_Parameter_OutWidth, &originalOutWidth);
+        InParameters->Get(NVSDK_NGX_Parameter_OutHeight, &originalOutHeight);
+
+        InParameters->Set(NVSDK_NGX_Parameter_Output, pipeline.rrBaseOutput.Get());
+        InParameters->Set(NVSDK_NGX_Parameter_OutWidth, pipeline.baseWidth);
+        InParameters->Set(NVSDK_NGX_Parameter_OutHeight, pipeline.baseHeight);
+        const NVSDK_NGX_Result rrResult =
+            TryEvaluateOptiFeature(InCmdList, InFeatureHandle, InParameters, InCallback);
+
+        if (rrResult == NVSDK_NGX_Result_Success)
+        {
+            // RR has now written its base-resolution result. NR edits that result in place before
+            // the separate native DLSS feature performs the only final upscale.
+            DlssNr::EvaluateAfterUpscale(InCmdList, InParameters, nullptr, true);
+            InParameters->Set(NVSDK_NGX_Parameter_Color, pipeline.rrBaseOutput.Get());
+            InParameters->Set(NVSDK_NGX_Parameter_Output, originalOutput);
+            InParameters->Set(NVSDK_NGX_Parameter_OutWidth, originalOutWidth);
+            InParameters->Set(NVSDK_NGX_Parameter_OutHeight, originalOutHeight);
+
+            if (!pipeline.finalDlss->Evaluate(InCmdList, InParameters))
+                LOG_ERROR("DLSS-NR Test 1.0: final native DLSS SR evaluation failed");
+        }
+
+        InParameters->Set(NVSDK_NGX_Parameter_Color, originalColor);
+        InParameters->Set(NVSDK_NGX_Parameter_Output, originalOutput);
+        InParameters->Set(NVSDK_NGX_Parameter_OutWidth, originalOutWidth);
+        InParameters->Set(NVSDK_NGX_Parameter_OutHeight, originalOutHeight);
+        DlssNr::RestoreAfterUpscale(InParameters);
+        return rrResult;
+    }
+
+    if (isRayReconstruction && cfg.DlssNrRunBeforeSr.value_or_default())
+    {
+        static bool saidRrRestart = false;
+        if (!saidRrRestart)
+        {
+            saidRrRestart = true;
+            LOG_WARN("DLSS-NR Test 1.0: RR was created without the Performance pipeline; restart is required");
+        }
+    }
 
     // OptiScaler internal handling
     if (isSuperResolution)
