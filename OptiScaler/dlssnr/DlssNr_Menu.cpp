@@ -94,6 +94,9 @@ void RenderMenu(Config* config, float menuResScale)
         if (ImGui::Checkbox("Enable Neural Rendering", &enabled))
             config->DlssNrEnabled = enabled;
 
+        // Keep the keybind guidance attached to the setting it describes.
+        ImGui::TextDisabled("Can be toggled with a key -- bind it under Keybinds, \"Neural Rendering\".");
+
         HelpMarker("Synthesises detail in the upscaler's output, before frame generation sees it."
                        "\n\nNeeds two similarly named files beside OptiScaler, one character apart:"
                        "\n  nvngx_dlssnr.dll       NVIDIA's model (~165 MB) -- you supply it"
@@ -123,10 +126,6 @@ void RenderMenu(Config* config, float menuResScale)
         {
             ImGui::TextDisabled("Performance Mode off: Post-SR after native DLSS upscale.");
         }
-
-        // The toggle can be bound to a key, and nobody would think to look for it under Keybinds
-        // unless told. Dimmed, because it is a note rather than a setting.
-        ImGui::TextDisabled("Can be toggled with a key -- bind it under Keybinds, \"Neural Rendering\".");
 
         bool applyModel = config->DlssNrApplyModel.value_or_default();
         if (ImGui::Checkbox("Apply the model", &applyModel))
