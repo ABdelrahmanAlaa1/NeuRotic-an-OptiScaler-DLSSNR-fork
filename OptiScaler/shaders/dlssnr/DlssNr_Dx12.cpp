@@ -184,6 +184,15 @@ struct NrState
     NVSDK_NGX_Parameter* capabilityParams = nullptr;
     void* feature = nullptr;
 
+    // Private Queue mode uses these only for feature creation/recreation. Per-frame evaluation
+    // remains on the game's command list, so this is not an asynchronous NR path.
+    ID3D12CommandQueue* privateCreateQueue = nullptr;
+    ID3D12CommandAllocator* privateCreateAllocator = nullptr;
+    ID3D12GraphicsCommandList* privateCreateList = nullptr;
+    ID3D12Fence* privateCreateFence = nullptr;
+    UINT64 privateCreateFenceValue = 0;
+    HANDLE privateCreateEvent = nullptr;
+
     // A feature per extra pass, each with its own temporal history.
     //
     // One feature run three times in a frame is told three frames passed with nothing moving between
@@ -583,6 +592,95 @@ bool EnsureCapabilityParams(ID3D12Device* device)
     // back and quantises the Swin grid to a lattice we chose rather than the one it was trained on.
     ReportScalingRatios();
     return true;
+}
+
+static void ReleasePrivateCreateKit()
+{
+    if (g_nr.privateCreateEvent != nullptr) CloseHandle(g_nr.privateCreateEvent);
+    if (g_nr.privateCreateFence != nullptr) g_nr.privateCreateFence->Release();
+    if (g_nr.privateCreateList != nullptr) g_nr.privateCreateList->Release();
+    if (g_nr.privateCreateAllocator != nullptr) g_nr.privateCreateAllocator->Release();
+    if (g_nr.privateCreateQueue != nullptr) g_nr.privateCreateQueue->Release();
+    g_nr.privateCreateEvent = nullptr;
+    g_nr.privateCreateFence = nullptr;
+    g_nr.privateCreateList = nullptr;
+    g_nr.privateCreateAllocator = nullptr;
+    g_nr.privateCreateQueue = nullptr;
+    g_nr.privateCreateFenceValue = 0;
+}
+
+static bool EnsurePrivateCreateKit(ID3D12Device* device)
+{
+    if (g_nr.privateCreateQueue != nullptr) return true;
+    D3D12_COMMAND_QUEUE_DESC desc {};
+    desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    if (FAILED(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&g_nr.privateCreateQueue))) ||
+        FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_nr.privateCreateAllocator))) ||
+        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_nr.privateCreateAllocator, nullptr,
+                                         IID_PPV_ARGS(&g_nr.privateCreateList))) ||
+        FAILED(g_nr.privateCreateList->Close()) ||
+        FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_nr.privateCreateFence))))
+    {
+        LOG_ERROR("DLSS-NR Private Queue: creation kit setup failed");
+        ReleasePrivateCreateKit();
+        return false;
+    }
+    g_nr.privateCreateEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (g_nr.privateCreateEvent == nullptr)
+    {
+        LOG_ERROR("DLSS-NR Private Queue: creation fence event setup failed ({})", GetLastError());
+        ReleasePrivateCreateKit();
+        return false;
+    }
+    LOG_INFO("DLSS-NR Private Queue: direct queue, allocator, command list, and fence created");
+    return true;
+}
+
+static void* CreateNrFeature(const Config& cfg, ID3D12Device* device, ID3D12GraphicsCommandList* gameList,
+                             const std::filesystem::path& snippet, unsigned int workWidth, unsigned int workHeight)
+{
+    const bool privateQueue = cfg.DlssNrRenderingMode.value_or_default() == 2;
+    ID3D12GraphicsCommandList* createList = gameList;
+    if (privateQueue)
+    {
+        if (!EnsurePrivateCreateKit(device) || FAILED(g_nr.privateCreateAllocator->Reset()) ||
+            FAILED(g_nr.privateCreateList->Reset(g_nr.privateCreateAllocator, nullptr)))
+        {
+            LOG_ERROR("DLSS-NR Private Queue: feature creation was not submitted");
+            return nullptr;
+        }
+        createList = g_nr.privateCreateList;
+    }
+    void* feature = g_nr.create(snippet.wstring().c_str(), State::Instance().NVNGX_ApplicationDataPath.c_str(),
+                                device, createList, g_nr.capabilityParams, workWidth, workHeight,
+                                (int) cfg.DlssNrPreset.value_or_default(), cfg.DlssNrIntensity.value_or_default(),
+                                (int) cfg.DlssNrStyle.value_or_default(), cfg.DlssNrLocalStructure.value_or_default(),
+                                cfg.DlssNrLocalTone.value_or_default(), cfg.DlssNrSkinStructure.value_or_default(),
+                                cfg.DlssNrAutoMask.value_or_default() ? 1 : 0, 1);
+    if (!privateQueue) return feature;
+    if (FAILED(g_nr.privateCreateList->Close()))
+    {
+        LOG_ERROR("DLSS-NR Private Queue: command list close failed");
+        return nullptr;
+    }
+    ID3D12CommandList* lists[] = { g_nr.privateCreateList };
+    g_nr.privateCreateQueue->ExecuteCommandLists(1, lists);
+    const UINT64 fenceValue = ++g_nr.privateCreateFenceValue;
+    if (FAILED(g_nr.privateCreateQueue->Signal(g_nr.privateCreateFence, fenceValue)))
+    {
+        LOG_ERROR("DLSS-NR Private Queue: fence signal failed");
+        return nullptr;
+    }
+    if (g_nr.privateCreateFence->GetCompletedValue() < fenceValue &&
+        (FAILED(g_nr.privateCreateFence->SetEventOnCompletion(fenceValue, g_nr.privateCreateEvent)) ||
+         WaitForSingleObject(g_nr.privateCreateEvent, 2000) != WAIT_OBJECT_0))
+    {
+        LOG_ERROR("DLSS-NR Private Queue: creation fence wait failed or timed out");
+        return nullptr;
+    }
+    LOG_INFO("DLSS-NR Private Queue: NR feature creation completed at {}x{}; per-frame NR remains on the game queue",
+             workWidth, workHeight);
+    return feature;
 }
 
 // What the model says it wants to run at, per quality level. Logged once, used for nothing yet.
@@ -1864,17 +1962,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         }
 
         SetExtras(cfg, nullptr, nullptr, 0, 0, 0, 0);
-        g_nr.feature =
-            g_nr.create(snippet->wstring().c_str(), State::Instance().NVNGX_ApplicationDataPath.c_str(),
-                        device, cmdList, g_nr.capabilityParams, workWidth, workHeight,
-                        (int) cfg.DlssNrPreset.value_or_default(),
-                        cfg.DlssNrIntensity.value_or_default(), (int) cfg.DlssNrStyle.value_or_default(),
-                        cfg.DlssNrLocalStructure.value_or_default(), cfg.DlssNrLocalTone.value_or_default(),
-                        cfg.DlssNrSkinStructure.value_or_default(),
-                        cfg.DlssNrAutoMask.value_or_default() ? 1 : 0,
-                        // UI correction at the model's own default: with no UI layer fed to it there
-                        // is nothing for it to correct.
-                        1);
+        g_nr.feature = CreateNrFeature(cfg, device, cmdList, snippet.value(), workWidth, workHeight);
 
         if (g_nr.feature == nullptr)
         {
@@ -3751,6 +3839,8 @@ bool CaptureInProgress() { return g_capture.isActive(); }
 void Shutdown()
 {
     std::lock_guard<std::mutex> nrLock(g_nrMutex);
+
+    ReleasePrivateCreateKit();
 
     for (auto& r : g_nrRetired)
     {

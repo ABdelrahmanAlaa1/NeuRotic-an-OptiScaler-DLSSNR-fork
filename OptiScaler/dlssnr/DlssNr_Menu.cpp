@@ -90,6 +90,20 @@ void RenderMenu(Config* config, float menuResScale)
         ScopedIndent indent {};
         ImGui::Spacing();
 
+        static const char* renderModeNames[] = { "Quality", "Performance (Default)", "Private Queue" };
+        int renderMode = std::clamp(config->DlssNrRenderingMode.value_or_default(), 0, 2);
+        if (ImGui::Combo("Rendering mode", &renderMode, renderModeNames, IM_ARRAYSIZE(renderModeNames)))
+        {
+            config->DlssNrRenderingMode = renderMode;
+            config->DlssNrRunBeforeSr = renderMode != 0;
+            LOG_INFO("DLSS-NR rendering mode applied: {} ({})", renderModeNames[renderMode],
+                     renderMode == 0 ? "RR -> DLSS SR -> NR" : "RR -> NR -> DLSS SR");
+        }
+
+        HelpMarker("Quality keeps NR after native DLSS Super Resolution. Performance runs NR before "
+                   "native DLSS Super Resolution. Private Queue keeps the Performance route but uses a "
+                   "private direct queue only when creating or recreating the NR feature; it is not async.");
+
         bool enabled = config->DlssNrEnabled.value_or_default();
         if (ImGui::Checkbox("Enable Neural Rendering", &enabled))
             config->DlssNrEnabled = enabled;
@@ -103,28 +117,22 @@ void RenderMenu(Config* config, float menuResScale)
                        "\n  nvngx.dll_dlssnr.dll   the forwarder (~13 KB) -- ships in this package"
                        "\nUndocumented and driven directly, so none of this is officially supported.");
 
-        bool performanceMode = config->DlssNrRunBeforeSr.value_or_default();
-        if (ImGui::Checkbox("Performance Mode", &performanceMode))
-            config->DlssNrRunBeforeSr = performanceMode;
-
-        HelpMarker("Switches Neural Rendering to run at the base game resolution before it is upscaled. This can improve performance with a minor reduction in visual fidelity.");
-
         // The setting requests Pre-SR. It is deliberately not described as active until the
         // existing quarantine, reset, seed, and display-ready checks have all passed.
         const auto nrTelemetry = DlssNr::Telemetry();
-        if (performanceMode)
+        if (renderMode != 0)
         {
             if (nrTelemetry.preSrDisplayReady)
                 ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1.0f),
-                                   "Performance Mode active: Pre-SR, before native DLSS upscale.");
+                                   "%s active: Pre-SR, before native DLSS upscale.", renderModeNames[renderMode]);
             else if (nrTelemetry.outputQuarantined)
-                ImGui::TextDisabled("Performance Mode requested: changing path; NR output is withheld.");
+                ImGui::TextDisabled("%s requested: changing path; NR output is withheld.", renderModeNames[renderMode]);
             else
-                ImGui::TextDisabled("Performance Mode requested: waiting for a safe Pre-SR evaluation.");
+                ImGui::TextDisabled("%s requested: waiting for a safe Pre-SR evaluation.", renderModeNames[renderMode]);
         }
         else
         {
-            ImGui::TextDisabled("Performance Mode off: Post-SR after native DLSS upscale.");
+            ImGui::TextDisabled("Quality active: Post-SR after native DLSS upscale.");
         }
 
         bool applyModel = config->DlssNrApplyModel.value_or_default();

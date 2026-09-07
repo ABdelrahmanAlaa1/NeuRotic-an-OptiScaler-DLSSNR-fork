@@ -322,7 +322,17 @@ bool Config::Reload(std::filesystem::path iniPath)
             auto performanceMode = readBool("DlssNr", "PerformanceMode");
             if (!performanceMode.has_value())
                 performanceMode = readBool("DlssNr", "RunBeforeSR");
-            DlssNrRunBeforeSr.set_from_config(performanceMode);
+            auto renderingMode = readInt("DlssNr", "RenderingMode");
+            if (renderingMode.has_value())
+                renderingMode = std::clamp(renderingMode.value(), 0, 2);
+            else if (performanceMode.has_value())
+                renderingMode = performanceMode.value() ? 1 : 0;
+            // New configurations intentionally default to Performance. Existing profiles retain their
+            // explicit legacy PerformanceMode/RunBeforeSR selection until the user selects a mode.
+            else
+                renderingMode = 1;
+            DlssNrRenderingMode.set_from_config(renderingMode);
+            DlssNrRunBeforeSr.set_from_config(renderingMode.value() != 0);
             DlssNrPreDlaa.set_from_config(readBool("DlssNr", "PreDlaa"));
             DlssNrToggleKey.set_from_config(readInt("DlssNr", "ToggleKey"));
             DlssNrTransferStrength.set_from_config(readFloat("DlssNr", "TransferStrength"));
@@ -1206,7 +1216,10 @@ bool Config::SaveIni()
     // --- DLSS 5 Neural Rendering (OptiScaler/dlssnr) ---
     ini.SetValue("DlssNr", "Enabled", GetBoolValue(Instance()->DlssNrEnabled.value_for_config()).c_str());
     // Persist the user-facing key and retain the legacy spelling for prior Alpha builds.
-    const auto performanceMode = GetBoolValue(Instance()->DlssNrRunBeforeSr.value_for_config());
+    auto renderingMode = Instance()->DlssNrRenderingMode.value_for_config();
+    renderingMode = std::clamp(renderingMode, 0, 2);
+    ini.SetLongValue("DlssNr", "RenderingMode", renderingMode);
+    const auto performanceMode = GetBoolValue(renderingMode != 0);
     ini.SetValue("DlssNr", "PerformanceMode", performanceMode.c_str());
     ini.SetValue("DlssNr", "RunBeforeSR", performanceMode.c_str());
     ini.SetValue("DlssNr", "PreDlaa", GetBoolValue(Instance()->DlssNrPreDlaa.value_for_config()).c_str());
