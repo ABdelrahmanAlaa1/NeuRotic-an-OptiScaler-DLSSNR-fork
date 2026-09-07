@@ -30,6 +30,66 @@
 static ankerl::unordered_dense::map<unsigned int, ContextData<IFeature_Dx12>> Dx12Contexts;
 static std::unordered_map<unsigned int, NVSDK_NGX_Feature> HandleToFeature;
 
+static const char* NgxFeatureName(NVSDK_NGX_Feature feature)
+{
+    switch (feature)
+    {
+    case NVSDK_NGX_Feature_SuperSampling:
+        return "Super Resolution";
+    case NVSDK_NGX_Feature_InPainting:
+        return "InPainting";
+    case NVSDK_NGX_Feature_ImageSuperResolution:
+        return "Image Super Resolution";
+    case NVSDK_NGX_Feature_SlowMotion:
+        return "Slow Motion";
+    case NVSDK_NGX_Feature_VideoSuperResolution:
+        return "Video Super Resolution";
+    case NVSDK_NGX_Feature_ImageSignalProcessing:
+        return "Image Signal Processing";
+    case NVSDK_NGX_Feature_DeepResolve:
+        return "Deep Resolve";
+    case NVSDK_NGX_Feature_FrameGeneration:
+        return "Frame Generation";
+    case NVSDK_NGX_Feature_DeepDVC:
+        return "DeepDVC";
+    case NVSDK_NGX_Feature_RayReconstruction:
+        return "Ray Reconstruction";
+    default:
+        return "Unknown/Reserved";
+    }
+}
+
+static void LogNgxCreateTrace(NVSDK_NGX_Feature feature, const char* route, NVSDK_NGX_Result result,
+                              const NVSDK_NGX_Handle* handle)
+{
+    LOG_INFO("DLSS-NR Test 0.9 trace: Create feature {} (id {}) via {}; result 0x{:X}, handle {}",
+             NgxFeatureName(feature), static_cast<int>(feature), route, static_cast<uint32_t>(result),
+             handle != nullptr ? handle->Id : 0);
+}
+
+struct NgxEvaluationTraceObservation
+{
+    bool tracked = false;
+    NVSDK_NGX_Feature feature = NVSDK_NGX_Feature_Reserved0;
+};
+
+static std::unordered_map<unsigned int, NgxEvaluationTraceObservation> NgxEvaluationTraceObservations;
+
+static void LogNgxEvaluationTrace(unsigned int handleId, bool tracked, NVSDK_NGX_Feature feature)
+{
+    const NgxEvaluationTraceObservation observed { tracked, feature };
+    const auto it = NgxEvaluationTraceObservations.find(handleId);
+    if (it != NgxEvaluationTraceObservations.end() && it->second.tracked == observed.tracked &&
+        it->second.feature == observed.feature)
+        return;
+
+    NgxEvaluationTraceObservations[handleId] = observed;
+    const char* route = handleId < DLSS_MOD_ID_OFFSET ? "native NGX handle" : "OptiScaler/provider handle";
+    LOG_INFO("DLSS-NR Test 0.9 trace: Evaluate handle {} feature {} (id {}), {}, {}", handleId,
+             tracked ? NgxFeatureName(feature) : "untracked", tracked ? static_cast<int>(feature) : -1,
+             tracked ? "mapped at creation" : "no mapped creation", route);
+}
+
 static bool IsNrPipelineFeature(NVSDK_NGX_Feature feature)
 {
     return feature == NVSDK_NGX_Feature_SuperSampling ||
@@ -841,6 +901,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsComma
             HandleToFeature[(*OutHandle)->Id] = InFeatureID;
         }
 
+        LogNgxCreateTrace(InFeatureID, "DLSSG replacement", res, *OutHandle);
         return res;
     }
 
@@ -864,6 +925,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsComma
                 LOG_INFO("Native CreateFeature failed: 0x{:X}", (uint32_t) res);
             }
 
+            LogNgxCreateTrace(InFeatureID, "native NGX passthrough", res, *OutHandle);
             return res;
         }
 
@@ -877,6 +939,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsComma
     if (tryResult == NVSDK_NGX_Result_Success)
         HandleToFeature[(*OutHandle)->Id] = InFeatureID;
 
+    LogNgxCreateTrace(InFeatureID, "OptiScaler pipeline", tryResult, *OutHandle);
     return tryResult;
 }
 
@@ -900,6 +963,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_ReleaseFeature(NVSDK_NGX_Handle* 
     const NVSDK_NGX_Feature releasedFeature =
         featureIt != HandleToFeature.end() ? featureIt->second : (NVSDK_NGX_Feature) 0;
     NrPipelineObservations.erase(handleId);
+    NgxEvaluationTraceObservations.erase(handleId);
     if (featureIt != HandleToFeature.end())
         HandleToFeature.erase(featureIt);
 
@@ -1203,6 +1267,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
     const bool isNrPipelineFeature = IsNrPipelineFeature(feature);
     const bool isSuperResolution = feature == NVSDK_NGX_Feature_SuperSampling;
     const bool isRayReconstruction = feature == NVSDK_NGX_Feature_RayReconstruction;
+    LogNgxEvaluationTrace(handleId, featureIt != HandleToFeature.end(), feature);
     LogNrPipelineObservation(handleId, feature, InParameters, cfg.DlssNrRunBeforeSr.value_or_default());
     static size_t evalWithoutFG = 0;
     bool fgCreated = std::any_of(HandleToFeature.begin(), HandleToFeature.end(),
