@@ -3719,6 +3719,14 @@ TelemetrySnapshot Telemetry()
     t.guideWidth = g_nr.guideWidth;
     t.guideHeight = g_nr.guideHeight;
     t.runBeforeSr = Config::Instance()->DlssNrRunBeforeSr.value_or_default();
+    t.preSrDisplayReady = t.runBeforeSr && g_nr.preSrScratchPrimed &&
+                          !g_nr.preSrAwaitingEvaluation && g_nr.preSrQuarantineFrames == 0 &&
+                          g_nr.feature != nullptr && !g_nr.failed;
+    t.transitionPending = t.runBeforeSr && !t.preSrDisplayReady;
+    t.outputQuarantined = t.runBeforeSr &&
+                           (g_nr.preSrQuarantineFrames != 0 || g_nr.preSrAwaitingEvaluation);
+    t.historyResetRequested = g_nr.reset;
+    t.seedEvaluationCompleted = g_nr.preSrScratchPrimed;
     t.running = g_nr.feature != nullptr && !g_nr.failed;
     t.failed = g_nr.failed;
     t.resetPending = g_nr.reset;

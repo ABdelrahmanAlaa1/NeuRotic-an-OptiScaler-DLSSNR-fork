@@ -137,6 +137,14 @@ struct TelemetrySnapshot
     unsigned int guideHeight = 0;
 
     bool runBeforeSr = false;
+    // Pre-SR is only active after its private seed evaluation has succeeded and the first
+    // displayable evaluation has completed. These fields intentionally separate the request
+    // from a safe, visible path switch.
+    bool preSrDisplayReady = false;
+    bool transitionPending = false;
+    bool outputQuarantined = false;
+    bool historyResetRequested = false;
+    bool seedEvaluationCompleted = false;
     bool running = false;
     bool failed = false;
     bool resetPending = false;

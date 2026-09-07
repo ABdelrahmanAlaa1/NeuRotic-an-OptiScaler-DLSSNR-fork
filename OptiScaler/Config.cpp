@@ -317,7 +317,12 @@ bool Config::Reload(std::filesystem::path iniPath)
 
             // --- DLSS 5 Neural Rendering (OptiScaler/dlssnr) ---
             DlssNrEnabled.set_from_config(readBool("DlssNr", "Enabled"));
-            DlssNrRunBeforeSr.set_from_config(readBool("DlssNr", "RunBeforeSR"));
+            // PerformanceMode is the user-facing name. Keep accepting the older experimental
+            // key so profiles created before Alpha 0.4 retain their selected render path.
+            auto performanceMode = readBool("DlssNr", "PerformanceMode");
+            if (!performanceMode.has_value())
+                performanceMode = readBool("DlssNr", "RunBeforeSR");
+            DlssNrRunBeforeSr.set_from_config(performanceMode);
             DlssNrPreDlaa.set_from_config(readBool("DlssNr", "PreDlaa"));
             DlssNrToggleKey.set_from_config(readInt("DlssNr", "ToggleKey"));
             DlssNrTransferStrength.set_from_config(readFloat("DlssNr", "TransferStrength"));
@@ -1200,7 +1205,10 @@ bool Config::SaveIni()
 
     // --- DLSS 5 Neural Rendering (OptiScaler/dlssnr) ---
     ini.SetValue("DlssNr", "Enabled", GetBoolValue(Instance()->DlssNrEnabled.value_for_config()).c_str());
-    ini.SetValue("DlssNr", "RunBeforeSR", GetBoolValue(Instance()->DlssNrRunBeforeSr.value_for_config()).c_str());
+    // Persist the user-facing key and retain the legacy spelling for prior Alpha builds.
+    const auto performanceMode = GetBoolValue(Instance()->DlssNrRunBeforeSr.value_for_config());
+    ini.SetValue("DlssNr", "PerformanceMode", performanceMode.c_str());
+    ini.SetValue("DlssNr", "RunBeforeSR", performanceMode.c_str());
     ini.SetValue("DlssNr", "PreDlaa", GetBoolValue(Instance()->DlssNrPreDlaa.value_for_config()).c_str());
     {
         auto toggle = Instance()->DlssNrToggleKey.value_for_config();

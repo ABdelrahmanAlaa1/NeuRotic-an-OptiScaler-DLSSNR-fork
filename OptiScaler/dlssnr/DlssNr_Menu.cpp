@@ -100,6 +100,30 @@ void RenderMenu(Config* config, float menuResScale)
                        "\n  nvngx.dll_dlssnr.dll   the forwarder (~13 KB) -- ships in this package"
                        "\nUndocumented and driven directly, so none of this is officially supported.");
 
+        bool performanceMode = config->DlssNrRunBeforeSr.value_or_default();
+        if (ImGui::Checkbox("Performance Mode", &performanceMode))
+            config->DlssNrRunBeforeSr = performanceMode;
+
+        HelpMarker("Switches Neural Rendering to run at the base game resolution before it is upscaled. This can improve performance with a minor reduction in visual fidelity.");
+
+        // The setting requests Pre-SR. It is deliberately not described as active until the
+        // existing quarantine, reset, seed, and display-ready checks have all passed.
+        const auto nrTelemetry = DlssNr::Telemetry();
+        if (performanceMode)
+        {
+            if (nrTelemetry.preSrDisplayReady)
+                ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1.0f),
+                                   "Performance Mode active: Pre-SR, before native DLSS upscale.");
+            else if (nrTelemetry.outputQuarantined)
+                ImGui::TextDisabled("Performance Mode requested: changing path; NR output is withheld.");
+            else
+                ImGui::TextDisabled("Performance Mode requested: waiting for a safe Pre-SR evaluation.");
+        }
+        else
+        {
+            ImGui::TextDisabled("Performance Mode off: Post-SR after native DLSS upscale.");
+        }
+
         // The toggle can be bound to a key, and nobody would think to look for it under Keybinds
         // unless told. Dimmed, because it is a note rather than a setting.
         ImGui::TextDisabled("Can be toggled with a key -- bind it under Keybinds, \"Neural Rendering\".");
@@ -1064,4 +1088,3 @@ void RenderMenu(Config* config, float menuResScale)
 }
 
 } // namespace DlssNr
-
