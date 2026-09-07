@@ -1216,9 +1216,8 @@ bool Config::SaveIni()
     // --- DLSS 5 Neural Rendering (OptiScaler/dlssnr) ---
     ini.SetValue("DlssNr", "Enabled", GetBoolValue(Instance()->DlssNrEnabled.value_for_config()).c_str());
     // Persist the user-facing key and retain the legacy spelling for prior Alpha builds.
-    auto renderingMode = Instance()->DlssNrRenderingMode.value_for_config();
-    renderingMode = std::clamp(renderingMode, 0, 2);
-    ini.SetLongValue("DlssNr", "RenderingMode", renderingMode);
+    const int renderingMode = std::clamp(Instance()->DlssNrRenderingMode.value_or_default(), 0, 2);
+    ini.SetLongValue("DlssNr", "RenderingMode", static_cast<long>(renderingMode));
     const auto performanceMode = GetBoolValue(renderingMode != 0);
     ini.SetValue("DlssNr", "PerformanceMode", performanceMode.c_str());
     ini.SetValue("DlssNr", "RunBeforeSR", performanceMode.c_str());
