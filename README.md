@@ -38,6 +38,10 @@
 
 ## About
 
+### NeuRotic Alpha 0.4 fork
+
+This fork publishes the NeuRotic Alpha 0.4 Neural Rendering work: telemetry, safer Pre-SR readiness/reset handling, per-mode DLSS preset routing, an optional NR Performance Mode, and clearer in-game controls. See the complete [Alpha 0.4 feature list and installation instructions](ALPHA-0.4.md).
+
 **OptiScaler** is a tool that lets you replace upscalers in games that ***already support DLSS2+ / FSR2+ / XeSS*** ($`^1`$), as well as manage ***frame generation*** in already mentioned games _(either by replacing existing FG options or enabling it in DX12 games through experimental ***OptiFG***)_. It also offers extensive customization options for all users, including those with Nvidia GPUs using DLSS.
 
 > [!CAUTION]
@@ -190,4 +194,3 @@ This project uses [FreeType](https://gitlab.freedesktop.org/freetype/freetype) l
   </tr>
  </tbody>
 </table>
-
