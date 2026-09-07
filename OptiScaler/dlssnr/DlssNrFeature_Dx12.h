@@ -20,7 +20,8 @@ class Config;
 
 namespace DlssNr
 {
-inline constexpr unsigned int MaxPassCount = 3;
+inline constexpr unsigned int MaxPassCount = 30;
+inline constexpr unsigned int DefaultMaxPassCount = 3;
 
 // The model runs immediately after the game's upscaler, before the interface is drawn. It is shown a
 // display-referred proxy of that frame -- the sort of picture it was trained on -- and its answer is

@@ -6,7 +6,7 @@ select DLSS in the game/OptiScaler as well for a DLSS-on-both-branches compariso
 
 ## Enable
 
-Use a build containing this source change (not v0.6.2). Under **DLSS Neural Rendering**, enable
+Use v0.7.0 or a newer build containing this change (not v0.6.2). Under **DLSS Neural Rendering**, enable
 **Generate before SR, apply after SR (DLSS)**. It overrides, but does not erase, the existing
 **Apply before Super Resolution** checkbox. Or configure:
 
@@ -22,6 +22,10 @@ Keep **Apply model** on; turn off frame hold, debug/compare views and skin-mask 
 comparison keep FG and RR off and use the same model profile, exposure and strengths. Model resolution
 is relative to the active render raster, not final output: 100% for a 1080p input runs NR at 1080p.
 Existing per-pass controls remain effective. The menu reports the private DLSS path separately.
+
+An optional [half-rate residual FG experiment](RESIDUAL-FG-PROTOTYPE.md) adds every-other-frame
+NR with NVIDIA interpolation. It has additional latency, camera and downstream-effect limitations;
+the every-frame pipeline described below remains the default.
 
 Requires your own working NVIDIA DLSS SR runtime and NVIDIA NR runtime. None is redistributed with
 this change. GPU/runtime support is determined by actual private DLSS creation/evaluation, not a GPU
@@ -76,7 +80,8 @@ matching full-resolution NR or restoring the reported gun-rack shadows is made.
   Neutral samples stayed exactly 0.5; dark/neutral/bright band centres returned 0.25/0.5/0.75.
 - That hardware test uses synthetic static inputs and real DLSS, not an NR model, game injection or the
   complete before/after hook. Moving-scene alignment, private-pass scheduling in games, FG compatibility,
-  visual quality and performance remain unverified. No new game DLLs have been installed by this work.
+  visual quality and performance require separate live-game validation. Experimental builds have been
+  installed locally in BG3 and Jedi Survivor; see the residual FG notes for the newer tests.
 
 Reproduce from an x64 VS developer prompt:
 
