@@ -21,6 +21,7 @@
 
 #include <mutex>
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include "precompile/DlssNr_Shader.h"
 #include "../output_scaling/OS_Dx12.h"
@@ -164,6 +165,47 @@ using PFN_NrProbeFloat = void(__cdecl*) (void*, const char*, float, int);
 
 // One per back buffer, so an allocator is never reset while its frame is still in flight.
 
+struct PreSrSignature
+{
+    uint32_t inputWidth = 0;
+    uint32_t inputHeight = 0;
+    DXGI_FORMAT inputFormat = DXGI_FORMAT_UNKNOWN;
+    uint32_t outputWidth = 0;
+    uint32_t outputHeight = 0;
+    DXGI_FORMAT outputFormat = DXGI_FORMAT_UNKNOWN;
+    uint32_t workWidth = 0;
+    uint32_t workHeight = 0;
+    int perfQuality = -999999;
+    bool preDlaa = false;
+    unsigned int preset = 0;
+    float intensity = 0.0f;
+    unsigned int style = 0;
+    float localStructure = 0.0f;
+    float localTone = 0.0f;
+    float skinStructure = 0.0f;
+    bool autoMask = false;
+
+    bool operator==(const PreSrSignature& other) const
+    {
+        return inputWidth == other.inputWidth && inputHeight == other.inputHeight &&
+               inputFormat == other.inputFormat && outputWidth == other.outputWidth &&
+               outputHeight == other.outputHeight && outputFormat == other.outputFormat &&
+               workWidth == other.workWidth && workHeight == other.workHeight &&
+               perfQuality == other.perfQuality && preDlaa == other.preDlaa &&
+               preset == other.preset && intensity == other.intensity && style == other.style &&
+               localStructure == other.localStructure && localTone == other.localTone &&
+               skinStructure == other.skinStructure && autoMask == other.autoMask;
+    }
+};
+
+struct TransitionFailureCircuit
+{
+    PreSrSignature signature {};
+    bool valid = false;
+    uint32_t failures = 0;
+    std::chrono::steady_clock::time_point retryAfter {};
+};
+
 struct NrState
 {
     HMODULE forwarder = nullptr;
@@ -226,19 +268,23 @@ struct NrState
     // of rendered frames, so high-refresh systems do not race through an arbitrary settle window.
     bool preSrAwaitingEvaluation = false;
     bool preSrResetWasRequested = false;
-    uint32_t preSrQuarantineFrames = 0;
+    TransitionFailureCircuit preSrFailureCircuit {};
+    TransitionFailureCircuit preDlaaFailureCircuit {};
     NVSDK_NGX_Handle* preDlaaFeature = nullptr;
     ID3D12Resource* preDlaaOutput = nullptr;
     uint32_t preDlaaWidth = 0;
     uint32_t preDlaaHeight = 0;
     DXGI_FORMAT preDlaaFormat = DXGI_FORMAT_UNKNOWN;
-    uint32_t preDlaaWarmFrames = 0;
     bool preDlaaNeedsReset = true;
     bool preDlaaFinalResetPending = true;
     bool preDlaaFinalOverrideActive = false;
     float preDlaaSavedJitterX = 0.0f;
     float preDlaaSavedJitterY = 0.0f;
     int preDlaaSavedReset = 0;
+
+    // Incremented only when the model evaluate itself succeeds. Pre-SR uses the serial rather than
+    // inferring readiness from feature existence or the absence of an error flag.
+    unsigned long long successfulEvaluations = 0;
 
     // The frame as the upscaler wrote it. The resolve adds the model's edit to this rather than
     // reconstructing it by inverting the tone curve, which is what turned every light in the frame into
@@ -444,11 +490,68 @@ unsigned long long g_featureBuilds = 0;
 unsigned long long g_featureRebuilds = 0;
 unsigned long long g_evaluateFailures = 0;
 
+constexpr uint32_t kTransitionFailureLimit = 4;
+
+void ClearTransitionFailure(TransitionFailureCircuit& circuit)
+{
+    circuit = {};
+}
+
+bool TransitionCircuitOpen(const TransitionFailureCircuit& circuit)
+{
+    return circuit.valid && circuit.failures >= kTransitionFailureLimit;
+}
+
+bool TransitionAttemptAllowed(TransitionFailureCircuit& circuit, const PreSrSignature& signature)
+{
+    if (circuit.valid && !(circuit.signature == signature))
+        ClearTransitionFailure(circuit);
+
+    if (!circuit.valid)
+        return true;
+
+    if (TransitionCircuitOpen(circuit))
+        return false;
+
+    return std::chrono::steady_clock::now() >= circuit.retryAfter;
+}
+
+void RecordTransitionFailure(TransitionFailureCircuit& circuit, const PreSrSignature& signature,
+                             const char* path)
+{
+    if (!circuit.valid || !(circuit.signature == signature))
+    {
+        circuit = {};
+        circuit.signature = signature;
+        circuit.valid = true;
+    }
+
+    ++circuit.failures;
+
+    if (circuit.failures >= kTransitionFailureLimit)
+    {
+        LOG_ERROR("DLSS-NR {} transition circuit open after {} failures for input {}x{} format {}, "
+                  "output {}x{} format {}, work {}x{}, quality {}; bypassing this signature until "
+                  "the configuration changes or Retry is requested",
+                  path, circuit.failures, signature.inputWidth, signature.inputHeight,
+                  (int) signature.inputFormat, signature.outputWidth, signature.outputHeight,
+                  (int) signature.outputFormat, signature.workWidth, signature.workHeight,
+                  signature.perfQuality);
+        return;
+    }
+
+    const uint32_t delayMs = 250u << std::min(circuit.failures - 1u, 3u);
+    circuit.retryAfter = std::chrono::steady_clock::now() + std::chrono::milliseconds(delayMs);
+    LOG_WARN("DLSS-NR {} transition failed for input {}x{}, output {}x{}, work {}x{}, quality {}; "
+             "retry {}/{} in {} ms while the game path remains untouched",
+             path, signature.inputWidth, signature.inputHeight, signature.outputWidth,
+             signature.outputHeight, signature.workWidth, signature.workHeight,
+             signature.perfQuality, circuit.failures + 1u, kTransitionFailureLimit, delayMs);
+}
+
 // A capture requested from outside the game: when the render path has no fence of its own, the write
 // waits until this frame count, by which point the GPU is certainly past the copies.
 unsigned long long g_captureWriteAtFrame = 0;
-
-constexpr uint32_t kPreSrQuarantineFrames = 20;
 
 // Dropping a file named dlssnr-capture.trigger beside OptiScaler requests a capture, so a session can
 // be asked for one from outside the game -- no alt-tab, no menu. Checked once a second, effectively.
@@ -845,7 +948,7 @@ void ForgetCalibration()
     g_nr.calibWhy = "measuring...";
 }
 
-void ReleaseSurfacesIfFormatChanged(DXGI_FORMAT needed)
+void ReleaseSurfacesIfFormatChanged(DXGI_FORMAT needed, ID3D12Resource* activeTarget)
 {
     if (g_nr.output == nullptr || g_nr.output->GetDesc().Format == needed)
         return;
@@ -864,9 +967,18 @@ void ReleaseSurfacesIfFormatChanged(DXGI_FORMAT needed)
     for (void*& f : g_nr.passFeature)
         ParkNrFeature(f);
 
-    for (ID3D12Resource** r :
-         { &g_nr.output, &g_nr.colorCopy, &g_nr.hdrCopy, &g_nr.colorSmall, &g_nr.preSrScratch, &g_nr.preSrRejitter })
+    for (ID3D12Resource** r : { &g_nr.output, &g_nr.colorCopy, &g_nr.hdrCopy, &g_nr.colorSmall })
         ParkNrResource(*r);
+
+    // EvaluateBeforeUpscale prepares its replacement pair before entering Dispatch. Preserve that
+    // pair when it is the active target; retiring it here would force another allocation next frame.
+    if (activeTarget == nullptr || activeTarget != g_nr.preSrScratch)
+    {
+        ParkNrResource(g_nr.preSrScratch);
+        ParkNrResource(g_nr.preSrRejitter);
+        g_nr.preSrScratchPrimed = false;
+        g_nr.preSrAwaitingEvaluation = true;
+    }
 
     g_nr.reset = true;
 }
@@ -1857,7 +1969,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
 
     const bool reduced = workWidth != width || workHeight != height;
 
-    ReleaseSurfacesIfFormatChanged(desc.Format);
+    ReleaseSurfacesIfFormatChanged(desc.Format, target);
 
     const bool resolutionChanged = g_nr.width != width || g_nr.height != height ||
                                    g_nr.workWidth != workWidth || g_nr.workHeight != workHeight;
@@ -1888,11 +2000,15 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             ParkNrResource(g_nr.hdrCopy);
             ParkNrResource(g_nr.colorSmall);
             ParkNrResource(g_nr.outputNative);
-            ParkNrResource(g_nr.preSrScratch);
-            ParkNrResource(g_nr.preSrRejitter);
-            g_nr.preSrScratchPrimed = false;
-            g_nr.preSrAwaitingEvaluation = true;
-            g_nr.preSrQuarantineFrames = kPreSrQuarantineFrames;
+            // Pre-SR prepares the new pair before Dispatch. Keep it through the feature rebuild so
+            // the first reset/seed evaluation can use the exact resources selected for this signature.
+            if (target != g_nr.preSrScratch)
+            {
+                ParkNrResource(g_nr.preSrScratch);
+                ParkNrResource(g_nr.preSrRejitter);
+                g_nr.preSrScratchPrimed = false;
+                g_nr.preSrAwaitingEvaluation = true;
+            }
         }
     }
 
@@ -2406,6 +2522,10 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             LOG_ERROR("DLSS-NR (proxy): evaluate returned 0x{:X} ({}), disabling for this session",
                       proxyResult, NgxResultName(proxyResult));
         }
+        else
+        {
+            ++g_nr.successfulEvaluations;
+        }
 
         Barrier(cmdList, target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, outputArrival);
         device->Release();
@@ -2488,6 +2608,8 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
 
     if (result == NVSDK_NGX_Result_Success)
     {
+        ++g_nr.successfulEvaluations;
+
         // Resolve takes the difference between what the model returned and what it was shown, and adds
         // that back to the frame. At strength zero the result is what the upscaler produced, exactly, and
         // anything the model left alone is untouched rather than round-tripped through the curve.
@@ -2704,7 +2826,9 @@ void RetryAfterFailure()
     g_nr.failed = false;
     g_nr.reason = "";
     g_nr.reset = true;
-
+    g_nr.preSrAwaitingEvaluation = true;
+    ClearTransitionFailure(g_nr.preSrFailureCircuit);
+    ClearTransitionFailure(g_nr.preDlaaFailureCircuit);
 }
 
 void NotifyUpscalerRelease()
@@ -2723,12 +2847,13 @@ void NotifyUpscalerRelease()
     g_nr.preSrObservedPerfQuality = -999999;
     g_nr.preSrScratchPrimed = false;
     g_nr.preSrAwaitingEvaluation = true;
-    g_nr.preSrQuarantineFrames = kPreSrQuarantineFrames;
     g_nr.preSrResetWasRequested = false;
     g_nr.reset = true;
+    ClearTransitionFailure(g_nr.preSrFailureCircuit);
+    ClearTransitionFailure(g_nr.preDlaaFailureCircuit);
 
     LOG_WARN("DLSS-NR v10 RAW PRE-SR: native upscaler feature released; "
-             "quarantining NR until replacement resources evaluate successfully");
+             "waiting for replacement resources to evaluate successfully");
 }
 
 struct PreDlaaRetired
@@ -2777,7 +2902,6 @@ void ParkPreDlaa()
     g_nr.preDlaaWidth = 0;
     g_nr.preDlaaHeight = 0;
     g_nr.preDlaaFormat = DXGI_FORMAT_UNKNOWN;
-    g_nr.preDlaaWarmFrames = 0;
     g_nr.preDlaaNeedsReset = true;
     g_nr.preDlaaFinalResetPending = true;
 }
@@ -2818,6 +2942,16 @@ ID3D12Resource* EvaluatePreDlaa(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Pa
     const D3D12_RESOURCE_DESC desc = color->GetDesc();
     const uint32_t width = (uint32_t) desc.Width;
     const uint32_t height = desc.Height;
+    const PreSrSignature signature { width,
+                                     height,
+                                     desc.Format,
+                                     width,
+                                     height,
+                                     desc.Format,
+                                     width,
+                                     height,
+                                     (int) NVSDK_NGX_PerfQuality_Value_DLAA,
+                                     true };
 
     const bool changed =
         g_nr.preDlaaWidth != width ||
@@ -2827,6 +2961,9 @@ ID3D12Resource* EvaluatePreDlaa(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Pa
     if (changed)
         ParkPreDlaa();
 
+    if (!TransitionAttemptAllowed(g_nr.preDlaaFailureCircuit, signature))
+        return nullptr;
+
     if (g_nr.preDlaaOutput == nullptr)
     {
         g_nr.preDlaaOutput = CreateScratch(device, desc.Format, width, height);
@@ -2834,6 +2971,7 @@ ID3D12Resource* EvaluatePreDlaa(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Pa
         if (g_nr.preDlaaOutput == nullptr)
         {
             LOG_WARN("DLSS-NR v10 DLAA-base: could not create {}x{} private DLAA output", width, height);
+            RecordTransitionFailure(g_nr.preDlaaFailureCircuit, signature, "private DLAA");
             return nullptr;
         }
 
@@ -2842,7 +2980,6 @@ ID3D12Resource* EvaluatePreDlaa(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Pa
         g_nr.preDlaaFormat = desc.Format;
         g_nr.preDlaaNeedsReset = true;
         g_nr.preDlaaFinalResetPending = true;
-        g_nr.preDlaaWarmFrames = 0;
     }
 
     unsigned int oldWidth = 0, oldHeight = 0, oldOutWidth = 0, oldOutHeight = 0;
@@ -2888,6 +3025,7 @@ ID3D12Resource* EvaluatePreDlaa(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Pa
         {
             LOG_WARN("DLSS-NR v10 DLAA-base: PRIVATE DLAA CreateFeature failed 0x{:X} ({})",
                      (unsigned int) createResult, NgxResultName((unsigned int) createResult));
+            RecordTransitionFailure(g_nr.preDlaaFailureCircuit, signature, "private DLAA");
             ParkPreDlaa();
             return nullptr;
         }
@@ -2895,10 +3033,9 @@ ID3D12Resource* EvaluatePreDlaa(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Pa
         g_nr.preDlaaFeature = handle;
         g_nr.preDlaaNeedsReset = true;
         g_nr.preDlaaFinalResetPending = true;
-        g_nr.preDlaaWarmFrames = 0;
 
         LOG_WARN("DLSS-NR v10 DLAA-base: created PRIVATE DLAA feature {}x{} -> {}x{}; "
-                 "warming its own temporal history",
+                 "waiting for its first successful reset evaluation",
                  width, height, width, height);
 
         // Same conservative rule used for NR: don't create and evaluate a new temporal feature
@@ -2914,6 +3051,7 @@ ID3D12Resource* EvaluatePreDlaa(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Pa
     int oldReset = 0;
     const bool haveReset =
         params->Get(NVSDK_NGX_Parameter_Reset, &oldReset) == NVSDK_NGX_Result_Success;
+    const bool seedEvaluation = g_nr.preDlaaNeedsReset;
 
     params->Set(NVSDK_NGX_Parameter_Width, width);
     params->Set(NVSDK_NGX_Parameter_Height, height);
@@ -2942,26 +3080,20 @@ ID3D12Resource* EvaluatePreDlaa(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Pa
     {
         LOG_WARN("DLSS-NR v10 DLAA-base: PRIVATE DLAA EvaluateFeature failed 0x{:X} ({})",
                  (unsigned int) evalResult, NgxResultName((unsigned int) evalResult));
+        RecordTransitionFailure(g_nr.preDlaaFailureCircuit, signature, "private DLAA");
         ParkPreDlaa();
         return nullptr;
     }
 
+    ClearTransitionFailure(g_nr.preDlaaFailureCircuit);
     g_nr.preDlaaNeedsReset = false;
     PreDlaaUavBarrier(cmdList, g_nr.preDlaaOutput);
 
-    constexpr uint32_t kPreDlaaWarmFrames = 8;
-    if (g_nr.preDlaaWarmFrames < kPreDlaaWarmFrames)
+    if (seedEvaluation)
     {
-        ++g_nr.preDlaaWarmFrames;
-
-        if (g_nr.preDlaaWarmFrames == kPreDlaaWarmFrames)
-        {
-            LOG_WARN("DLSS-NR v10 DLAA-base: private DLAA history is warm at {}x{}; "
-                     "DLAA -> NR -> re-jitter -> SR activates next frame",
-                     width, height);
-        }
-
-        return nullptr;
+        LOG_WARN("DLSS-NR v10 DLAA-base: private DLAA path ready after its first successful "
+                 "reset evaluation at {}x{}",
+                 width, height);
     }
 
     return g_nr.preDlaaOutput;
@@ -3020,6 +3152,32 @@ ID3D12Resource* EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_
     const bool havePerfQuality =
         params->Get(NVSDK_NGX_Parameter_PerfQualityValue, &perfQuality) == NVSDK_NGX_Result_Success;
 
+    float expectedScale = cfg.DlssNrWorkingScale.value_or_default();
+    expectedScale = expectedScale < 0.25f ? 0.25f : (expectedScale > 2.0f ? 2.0f : expectedScale);
+
+    unsigned int expectedWorkW = (unsigned int) (observedWidth * expectedScale + 0.5f);
+    unsigned int expectedWorkH = (unsigned int) (observedHeight * expectedScale + 0.5f);
+    expectedWorkW = std::max(8u, expectedWorkW & ~7u);
+    expectedWorkH = std::max(8u, expectedWorkH & ~7u);
+
+    const PreSrSignature signature { observedWidth,
+                                     observedHeight,
+                                     colorDesc.Format,
+                                     observedOutWidth,
+                                     observedOutHeight,
+                                     outputDesc.Format,
+                                     expectedWorkW,
+                                     expectedWorkH,
+                                     havePerfQuality ? perfQuality : -999999,
+                                     cfg.DlssNrPreDlaa.value_or_default(),
+                                     cfg.DlssNrPreset.value_or_default(),
+                                     cfg.DlssNrIntensity.value_or_default(),
+                                     cfg.DlssNrStyle.value_or_default(),
+                                     cfg.DlssNrLocalStructure.value_or_default(),
+                                     cfg.DlssNrLocalTone.value_or_default(),
+                                     cfg.DlssNrSkinStructure.value_or_default(),
+                                     cfg.DlssNrAutoMask.value_or_default() };
+
     int resetValue = 0;
     const bool resetRequested =
         params->Get(NVSDK_NGX_Parameter_Reset, &resetValue) == NVSDK_NGX_Result_Success &&
@@ -3032,14 +3190,11 @@ ID3D12Resource* EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_
     const bool resetEnded = !resetRequested && g_nr.preSrResetWasRequested;
     g_nr.preSrResetWasRequested = resetRequested;
 
-    // A reset can remain asserted across several evaluations. The old 20-frame guard stayed
-    // bypassed for the entire held-reset interval; rising-edge readiness must preserve that safety
-    // property and add the settle window after Reset falls as well.
+    // A reset can remain asserted across several evaluations. Keep NR bypassed only while Reset is
+    // actually held, then let the first coherent post-reset frame rebuild and seed the replacement.
+    // This preserves the held-reset safety property without an arbitrary frame-count delay.
     if (resetRequested || resetEnded)
-    {
         g_nr.reset = true;
-        g_nr.preSrQuarantineFrames = kPreSrQuarantineFrames;
-    }
 
     const bool inputChanged =
         g_nr.preSrObservedWidth != observedWidth ||
@@ -3076,12 +3231,10 @@ ID3D12Resource* EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_
         if (havePerfQuality)
             g_nr.preSrObservedPerfQuality = perfQuality;
 
-        // The game reset may have ended while this quarantine was running. Carry the transition
-        // into the NR feature itself so its first post-transition evaluation cannot reuse the old
-        // scene's temporal history.
+        // Carry the transition into the NR feature itself so its first post-transition evaluation
+        // cannot reuse the old scene's temporal history.
         g_nr.reset = true;
         g_nr.preSrAwaitingEvaluation = true;
-        g_nr.preSrQuarantineFrames = kPreSrQuarantineFrames;
         ParkNrResource(g_nr.preSrScratch);
         ParkNrResource(g_nr.preSrRejitter);
         g_nr.preSrScratchPrimed = false;
@@ -3095,18 +3248,19 @@ ID3D12Resource* EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_
                  observedOutWidth, observedOutHeight,
                  oldQuality, havePerfQuality ? perfQuality : oldQuality);
 
+    }
+
+    // Reset may remain asserted across several calls. Those frames are not a coherent post-reset
+    // configuration, so keep the native path untouched until the falling edge. The first frame after
+    // that edge proceeds directly into replacement preparation below.
+    if (resetRequested)
+    {
         device->Release();
         return nullptr;
     }
 
-    if (g_nr.preSrQuarantineFrames != 0)
+    if (!TransitionAttemptAllowed(g_nr.preSrFailureCircuit, signature))
     {
-        --g_nr.preSrQuarantineFrames;
-        if (g_nr.preSrQuarantineFrames == 0)
-        {
-            LOG_WARN("DLSS-NR v10 RAW PRE-SR: transition quarantine complete; testing the new path");
-        }
-
         device->Release();
         return nullptr;
     }
@@ -3118,7 +3272,7 @@ ID3D12Resource* EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_
     {
         nrBase = EvaluatePreDlaa(cmdList, params, color, device);
 
-        // Deliberately no raw->NR fallback. While DLAA is creating/warming, leave Wilds' normal
+        // Deliberately no raw->NR fallback. While DLAA is creating or seeding, leave Wilds' normal
         // DLSS path completely untouched so the two temporal histories never get mixed.
         if (nrBase == nullptr)
         {
@@ -3141,18 +3295,29 @@ ID3D12Resource* EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_
 
     if (scratchMismatch)
     {
+        ID3D12Resource* replacementScratch =
+            CreateScratch(device, colorDesc.Format, observedWidth, observedHeight);
+        ID3D12Resource* replacementRejitter =
+            CreateScratch(device, colorDesc.Format, observedWidth, observedHeight);
+
+        if (replacementScratch == nullptr || replacementRejitter == nullptr)
+        {
+            if (replacementScratch != nullptr)
+                replacementScratch->Release();
+            if (replacementRejitter != nullptr)
+                replacementRejitter->Release();
+
+            RecordTransitionFailure(g_nr.preSrFailureCircuit, signature, "Pre-SR scratch");
+            device->Release();
+            return nullptr;
+        }
+
         ParkNrResource(g_nr.preSrScratch);
         ParkNrResource(g_nr.preSrRejitter);
+        g_nr.preSrScratch = replacementScratch;
+        g_nr.preSrRejitter = replacementRejitter;
         g_nr.preSrScratchPrimed = false;
         g_nr.preSrAwaitingEvaluation = true;
-        g_nr.preSrScratch = CreateScratch(device, colorDesc.Format, observedWidth, observedHeight);
-        g_nr.preSrRejitter = CreateScratch(device, colorDesc.Format, observedWidth, observedHeight);
-    }
-
-    if (g_nr.preSrScratch == nullptr || g_nr.preSrRejitter == nullptr)
-    {
-        device->Release();
-        return nullptr;
     }
 
     const D3D12_RESOURCE_STATES baseState =
@@ -3167,14 +3332,6 @@ ID3D12Resource* EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_
     Barrier(cmdList, g_nr.preSrScratch, D3D12_RESOURCE_STATE_COPY_DEST,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
-    float expectedScale = cfg.DlssNrWorkingScale.value_or_default();
-    expectedScale = expectedScale < 0.25f ? 0.25f : (expectedScale > 2.0f ? 2.0f : expectedScale);
-
-    unsigned int expectedWorkW = (unsigned int) (observedWidth * expectedScale + 0.5f);
-    unsigned int expectedWorkH = (unsigned int) (observedHeight * expectedScale + 0.5f);
-    expectedWorkW = std::max(8u, expectedWorkW & ~7u);
-    expectedWorkH = std::max(8u, expectedWorkH & ~7u);
-
     const bool featureReadyBefore =
         g_nr.feature != nullptr &&
         g_nr.width == observedWidth &&
@@ -3183,13 +3340,38 @@ ID3D12Resource* EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_
         g_nr.workHeight == expectedWorkH &&
         TuningMatchesFeature(cfg);
 
+    const unsigned long long successfulEvaluationsBefore = g_nr.successfulEvaluations;
+
     params->Set(NVSDK_NGX_Parameter_Output, g_nr.preSrScratch);
     EvaluateAfterUpscale(cmdList, params, timingQueue, true);
     params->Set(NVSDK_NGX_Parameter_Output, originalOutputVoid);
 
+    if (g_nr.failed && g_nr.feature != nullptr)
+    {
+        // Evaluation and composition failures retain the existing session-failure policy. Only
+        // creation/readiness failures are retried automatically per transition signature.
+        g_nr.preSrAwaitingEvaluation = true;
+        device->Release();
+        return nullptr;
+    }
+
+    if (!featureReadyBefore && g_nr.feature == nullptr)
+    {
+        RecordTransitionFailure(g_nr.preSrFailureCircuit, signature, "Pre-SR feature creation");
+        g_nr.failed = false;
+        g_nr.reason = "";
+        g_nr.preSrScratchPrimed = false;
+        g_nr.preSrAwaitingEvaluation = true;
+        device->Release();
+        return nullptr;
+    }
+
     if (!featureReadyBefore)
     {
-        g_nr.preSrScratchPrimed = true;
+        // A newly created temporal feature is submitted on this frame but deliberately not evaluated
+        // in the same command list. The next coherent frame performs the reset/seed evaluation.
+        ClearTransitionFailure(g_nr.preSrFailureCircuit);
+        g_nr.preSrScratchPrimed = false;
         g_nr.preSrAwaitingEvaluation = true;
         device->Release();
         return nullptr;
@@ -3205,6 +3387,18 @@ ID3D12Resource* EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_
         return nullptr;
     }
 
+    if (g_nr.successfulEvaluations == successfulEvaluationsBefore)
+    {
+        // The pass can safely decline a frame when the game's compute state is not restorable. That
+        // is not readiness: wait for an evaluation that actually completed.
+        g_nr.preSrScratchPrimed = false;
+        g_nr.preSrAwaitingEvaluation = true;
+        device->Release();
+        return nullptr;
+    }
+
+    ClearTransitionFailure(g_nr.preSrFailureCircuit);
+    g_nr.preSrScratchPrimed = true;
     if (g_nr.preSrAwaitingEvaluation)
     {
         g_nr.preSrAwaitingEvaluation = false;
@@ -3777,9 +3971,25 @@ CalibrationReading Calibration()
     return r;
 }
 
-bool IsRunning() { return g_nr.feature != nullptr && !g_nr.failed; }
+bool IsRunning()
+{
+    const bool transitionFailed =
+        Config::Instance()->DlssNrRunBeforeSr.value_or_default() &&
+        (TransitionCircuitOpen(g_nr.preSrFailureCircuit) ||
+         TransitionCircuitOpen(g_nr.preDlaaFailureCircuit));
+    return g_nr.feature != nullptr && !g_nr.failed && !transitionFailed;
+}
 
-const char* FailureReason() { return g_nr.failed ? g_nr.reason : ""; }
+const char* FailureReason()
+{
+    if (g_nr.failed)
+        return g_nr.reason;
+    if (TransitionCircuitOpen(g_nr.preSrFailureCircuit))
+        return "Pre-SR resources or feature failed repeatedly for this configuration";
+    if (TransitionCircuitOpen(g_nr.preDlaaFailureCircuit))
+        return "the private DLAA path failed repeatedly for this configuration";
+    return "";
+}
 
 // What the game offers by way of exposure, and what has been read from it. For the menu, so a user
 // can see whether this game supplies one at all without having to read a log.
@@ -3810,15 +4020,14 @@ TelemetrySnapshot Telemetry()
     t.guideHeight = g_nr.guideHeight;
     t.runBeforeSr = Config::Instance()->DlssNrRunBeforeSr.value_or_default();
     t.preSrDisplayReady = t.runBeforeSr && g_nr.preSrScratchPrimed &&
-                          !g_nr.preSrAwaitingEvaluation && g_nr.preSrQuarantineFrames == 0 &&
-                          g_nr.feature != nullptr && !g_nr.failed;
+                          !g_nr.preSrAwaitingEvaluation && g_nr.feature != nullptr && !g_nr.failed;
     t.transitionPending = t.runBeforeSr && !t.preSrDisplayReady;
-    t.outputQuarantined = t.runBeforeSr &&
-                           (g_nr.preSrQuarantineFrames != 0 || g_nr.preSrAwaitingEvaluation);
+    t.outputQuarantined = t.runBeforeSr && g_nr.preSrAwaitingEvaluation;
     t.historyResetRequested = g_nr.reset;
     t.seedEvaluationCompleted = g_nr.preSrScratchPrimed;
-    t.running = g_nr.feature != nullptr && !g_nr.failed;
-    t.failed = g_nr.failed;
+    t.failed = g_nr.failed || TransitionCircuitOpen(g_nr.preSrFailureCircuit) ||
+               TransitionCircuitOpen(g_nr.preDlaaFailureCircuit);
+    t.running = g_nr.feature != nullptr && !t.failed;
     t.resetPending = g_nr.reset;
     t.totalGpuMs = g_lastGpuTime;
     t.modelGpuMs = g_lastNgxTime;
@@ -3901,7 +4110,10 @@ void Shutdown()
     g_nr.preSrObservedPerfQuality = -999999;
     g_nr.preSrAwaitingEvaluation = false;
     g_nr.preSrResetWasRequested = false;
-    g_nr.preSrQuarantineFrames = 0;
+    g_nr.preSrScratchPrimed = false;
+    g_nr.successfulEvaluations = 0;
+    ClearTransitionFailure(g_nr.preSrFailureCircuit);
+    ClearTransitionFailure(g_nr.preDlaaFailureCircuit);
 
     if (g_nr.hdrCopy != nullptr)
     {

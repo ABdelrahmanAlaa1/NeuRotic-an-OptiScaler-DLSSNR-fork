@@ -53,7 +53,8 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
 // The settings panel, drawn inside OptiScaler's menu.
 void RenderMenu(::Config* config, float menuResScale);
 
-// Clears the session failure latch, so a failure caused by transient thrash does not cost a restart.
+// Clears the session failure latch and bounded transition circuits, so transient failure does not
+// require a restart.
 void RetryAfterFailure();
 
 // A native upscaler feature was released.  Its replacement may reuse dimensions, so preserve the

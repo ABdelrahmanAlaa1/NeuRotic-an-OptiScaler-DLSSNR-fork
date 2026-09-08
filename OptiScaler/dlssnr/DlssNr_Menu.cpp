@@ -117,7 +117,7 @@ void RenderMenu(Config* config, float menuResScale)
                        "\nUndocumented and driven directly, so none of this is officially supported.");
 
         // The setting requests Pre-SR. It is deliberately not described as active until the
-        // existing quarantine, reset, seed, and display-ready checks have all passed.
+        // replacement-resource, reset, seed, and display-ready checks have all passed.
         const auto nrTelemetry = DlssNr::Telemetry();
         if (renderMode != 0)
         {
