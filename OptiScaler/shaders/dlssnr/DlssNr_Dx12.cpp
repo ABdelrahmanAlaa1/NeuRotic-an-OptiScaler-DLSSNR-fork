@@ -268,6 +268,7 @@ struct NrState
     // of rendered frames, so high-refresh systems do not race through an arbitrary settle window.
     bool preSrAwaitingEvaluation = false;
     bool preSrResetWasRequested = false;
+    bool nativeRayReconstructionActive = false;
     TransitionFailureCircuit preSrFailureCircuit {};
     TransitionFailureCircuit preDlaaFailureCircuit {};
     NVSDK_NGX_Handle* preDlaaFeature = nullptr;
@@ -2856,6 +2857,12 @@ void NotifyUpscalerRelease()
              "waiting for replacement resources to evaluate successfully");
 }
 
+void SetNativeRayReconstructionActive(bool active)
+{
+    std::lock_guard<std::mutex> nrLock(g_nrMutex);
+    g_nr.nativeRayReconstructionActive = active;
+}
+
 struct PreDlaaRetired
 {
     NVSDK_NGX_Handle* feature = nullptr;
@@ -4019,10 +4026,12 @@ TelemetrySnapshot Telemetry()
     t.guideWidth = g_nr.guideWidth;
     t.guideHeight = g_nr.guideHeight;
     t.runBeforeSr = Config::Instance()->DlssNrRunBeforeSr.value_or_default();
-    t.preSrDisplayReady = t.runBeforeSr && g_nr.preSrScratchPrimed &&
+    t.nativeRayReconstructionActive = g_nr.nativeRayReconstructionActive;
+    const bool preSrRouteRequested = t.runBeforeSr && !t.nativeRayReconstructionActive;
+    t.preSrDisplayReady = preSrRouteRequested && g_nr.preSrScratchPrimed &&
                           !g_nr.preSrAwaitingEvaluation && g_nr.feature != nullptr && !g_nr.failed;
-    t.transitionPending = t.runBeforeSr && !t.preSrDisplayReady;
-    t.outputQuarantined = t.runBeforeSr && g_nr.preSrAwaitingEvaluation;
+    t.transitionPending = preSrRouteRequested && !t.preSrDisplayReady;
+    t.outputQuarantined = preSrRouteRequested && g_nr.preSrAwaitingEvaluation;
     t.historyResetRequested = g_nr.reset;
     t.seedEvaluationCompleted = g_nr.preSrScratchPrimed;
     t.failed = g_nr.failed || TransitionCircuitOpen(g_nr.preSrFailureCircuit) ||
@@ -4221,6 +4230,7 @@ void Shutdown()
     g_featureBuilds = 0;
     g_featureRebuilds = 0;
     g_evaluateFailures = 0;
+    g_nr.nativeRayReconstructionActive = false;
 
     g_gpuTime.reset();
     g_ngxTime.reset();

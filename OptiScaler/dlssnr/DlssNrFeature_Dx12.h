@@ -61,6 +61,11 @@ void RetryAfterFailure();
 // interruption explicitly instead of assuming a later size change will invalidate NR history.
 void NotifyUpscalerRelease();
 
+// RR is a single native denoise/reconstruction/upscale pass. The input seam reports whether an RR
+// feature is active so telemetry and the menu do not claim that the Super Resolution Pre-SR route
+// is pending while NR is intentionally attached after RR.
+void SetNativeRayReconstructionActive(bool active);
+
 
 // Asks the model whether it will work on Direct3D 11 at all, once, and logs the answer.
 //
@@ -138,6 +143,7 @@ struct TelemetrySnapshot
     unsigned int guideHeight = 0;
 
     bool runBeforeSr = false;
+    bool nativeRayReconstructionActive = false;
     // Pre-SR is only active after its private seed evaluation has succeeded and the first
     // displayable evaluation has completed. These fields intentionally separate the request
     // from a safe, visible path switch.
