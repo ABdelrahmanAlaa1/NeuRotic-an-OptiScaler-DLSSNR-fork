@@ -32,7 +32,6 @@ VulkanUpscaler=dlss
 Enabled=true
 RunBeforeSR=true
 DeferredDLSS=false
-AsyncLatest=false
 ResidualFG=false
 Passes=1
 WorkingScale=1.0

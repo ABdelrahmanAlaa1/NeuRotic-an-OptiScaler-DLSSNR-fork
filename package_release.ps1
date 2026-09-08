@@ -14,6 +14,7 @@ param(
     [switch]$SkipBuild,
     [switch]$IncludeDlssFrameGeneration,
     [switch]$AcceptNvidiaLicenses,
+    [string]$HybridAssetsDirectory,
     [string]$StreamlineArchive
 )
 
@@ -187,7 +188,7 @@ if ($on) {
 
 Write-Host "ini verified: nothing switched on by default"
 
-foreach ($key in @('DeferredDLSS', 'ResidualFG', 'ResidualFGApproxCamera', 'AsyncLatest', 'UnlockPasses', 'AdaMfgUnlock')) {
+foreach ($key in @('DeferredDLSS', 'ResidualFG', 'ResidualFGApproxCamera', 'UnlockPasses', 'AdaMfgUnlock')) {
     if ($ini -match "(?mi)^$key=true\s*$") {
         throw "REFUSING: experimental option $key is enabled in the portable package"
     }
@@ -212,6 +213,19 @@ foreach ($requiredTextFile in @("$stage\README.md", "$stage\INSTALL-DLSSNR.md", 
     }
 }
 Write-Host "cross-generation guidance: present and hash-pinned"
+
+if ($HybridAssetsDirectory) {
+    $manifest = Get-Content -LiteralPath (Join-Path $HybridAssetsDirectory 'asset-manifest.json') -Raw | ConvertFrom-Json
+    foreach ($item in $manifest.files) {
+        $assetRoot = [IO.Path]::GetFullPath((Join-Path $HybridAssetsDirectory 'OptiScaler/nvfp4/hybrid'))
+        $source = [IO.Path]::GetFullPath((Join-Path $assetRoot $item.path))
+        if (-not $source.StartsWith($assetRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { throw 'Invalid hybrid asset path' }
+        if ((Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash -ne $item.sha256) { throw "Hybrid asset hash mismatch: $source" }
+        $target = Join-Path "$stage/OptiScaler/nvfp4/hybrid" $item.path
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
+        Copy-Item -LiteralPath $source -Destination $target
+    }
+}
 
 # Hash every shipped file after the staging tree is final. Use forward slashes so the list is easy
 # to verify from PowerShell, 7-Zip, Linux, or Wine.

@@ -2892,8 +2892,6 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
 namespace DlssNr
 {
 #include "DlssNr_DeferredSr.inl"
-#include "DlssNr_AsyncLatest.inl"
-
 std::string DeferredDlssStatus() { return SynchronousDeferredDlssStatus(); }
 
 void RetryAfterFailure()
@@ -3403,16 +3401,6 @@ bool CaptureInProgress() { return g_capture.isActive(); }
 void Shutdown()
 {
     std::lock_guard<std::recursive_mutex> nrLock(g_nrMutex);
-    if (!AsyncLatest::Shutdown())
-    {
-        DeferredSr::Shutdown();
-        // Unsubmitted/in-flight work may still reference NR state. Retain it for
-        // process teardown rather than block shutdown or release GPU-live objects.
-        (void)new NrState(std::move(g_nr));
-        (void)g_compose.release(); (void)g_gpuTime.release(); (void)g_ngxTime.release();
-        g_nrRetired.clear();
-        return;
-    }
     DeferredSr::Shutdown();
 
     for (auto& r : g_nrRetired)
