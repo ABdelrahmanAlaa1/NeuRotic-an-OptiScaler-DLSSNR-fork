@@ -18,30 +18,16 @@
 //   Resolve  proxy + model answer + untouched copy -> the frame, edited
 
 #include "DlssNr_Common.h"
+#include <dlssnr/NrGpuSafety.h>
 
 #include <d3d12.h>
 #include <d3dx/d3dx12.h>
 #include <shaders/Shader_Dx12.h>
 #include <shaders/Shader_Dx12Utils.h>
 
-// Three dispatches are recorded per frame and several frames can be in flight at once, more so with
-// frame generation. Each dispatch needs descriptors and constants the GPU is not still reading, so
-// there has to be enough for three passes times the deepest pipeline we might sit behind.
-// Descriptor and constant slots, consumed one per dispatch and reused round-robin with no fence.
-//
-// The pass records four dispatches per frame -- meter, encode, downsample, resolve -- so sixteen slots
-// is four frames of coverage before a slot is rewritten. The comment this replaces said "three passes
-// times the deepest pipeline we might sit behind", and the pass count has since grown to four while
-// the ring did not.
-//
-// Four frames is not enough. Frame generation deliberately runs the GPU several frames behind the CPU,
-// and the constants live in an UPLOAD heap written at record time -- so a wrap while the GPU is still
-// reading a slot rewrites descriptors and constants underneath it.
-//
-// A fifth dispatch has since been added -- the calibration grid -- which at thirty-two slots would
-// have left six frames, spending exactly the headroom the previous note set aside. Forty-eight
-// restores eight frames at five dispatches. If a sixth is ever added, raise this with it rather than
-// spending the margin again.
+// Bounded descriptor/constant capacity, not a frame-age safety guarantee. Each dispatch reserves
+// a slot until its recording is reset/destroyed AND all observed GPU executions have completed.
+// If the pool is busy, the entry point bypasses NR before recording output transitions.
 #define DLSSNR_NUM_OF_HEAPS 48
 
 class DlssNr_Dx12 : public Shader_Dx12, public DlssNr_Common
@@ -58,6 +44,7 @@ class DlssNr_Dx12 : public Shader_Dx12, public DlssNr_Common
     ID3D12Resource* _constantBuffers[DLSSNR_NUM_OF_HEAPS] = {};
 
     uint32_t _heapIndex = 0;
+    DlssNr::GpuSafety::Ticket _slotUse[DLSSNR_NUM_OF_HEAPS];
 
     // The shader reads five inputs and writes two, and not every mode uses all of them. Unused slots
     // still need a view bound -- an unbound descriptor is not an empty read, it is a read from
@@ -69,6 +56,7 @@ class DlssNr_Dx12 : public Shader_Dx12, public DlssNr_Common
     uint32_t _numThreadsY = 8;
 
   public:
+    bool HasFreeSlots(unsigned int count) const;
     DlssNr_Dx12(std::string InName, ID3D12Device* InDevice);
     ~DlssNr_Dx12();
 

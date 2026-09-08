@@ -23,6 +23,10 @@ class OS_Dx12 : public Shader_Dx12
     Scaler ActiveScaler() const;
 
     FrameDescriptorHeap _frameHeaps[OS_NUM_OF_HEAPS];
+    static constexpr unsigned int kNrSlots = 48;
+    std::unique_ptr<FrameDescriptorHeap[]> _nrHeaps;
+    ID3D12Resource* _nrConstants[kNrSlots] = {};
+    DlssNr::GpuSafety::Ticket _nrUse[kNrSlots];
 
     ID3D12Resource* _buffer = nullptr;
     D3D12_RESOURCE_STATES _bufferState = D3D12_RESOURCE_STATE_COMMON;

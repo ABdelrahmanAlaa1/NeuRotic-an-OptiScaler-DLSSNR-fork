@@ -15,6 +15,7 @@
 
 #include <windows.h>
 #include <d3d12.h>
+#include "NrGpuSafety.h"
 
 #include <cstdio>
 #include <filesystem>
@@ -30,6 +31,7 @@ constexpr unsigned int kMaxFrames = 8;
 struct Shot
 {
     ID3D12Resource* readback = nullptr;
+    DlssNr::GpuSafety::Ticket use;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout = {};
     unsigned long long bytes = 0;
 };
@@ -46,6 +48,7 @@ class FrameCapture
 
         wanted_ = frames > kMaxFrames ? kMaxFrames : frames;
         captured_ = 0;
+        shapeChanged_ = false;
         active_ = wanted_ > 0;
     }
 
@@ -62,18 +65,23 @@ class FrameCapture
         // Recording stops the moment the run is complete, and does not resume until write() has
         // released everything.
         //
-        // ready_ is set here but acted on eight frames later, because the caller has to let the GPU
-        // finish with these copies before mapping them. Without this guard those eight frames each
-        // recorded another one: captured_ walked past the end of a vector sized to exactly wanted_,
-        // and the garbage read back as a Shot had its pointer handed to CopyTextureRegion. The device
-        // was removed and the game went down with nothing in the log -- every single time anyone
-        // pressed the button.
+        // Completion can take arbitrarily many frames. Never record beyond the allocated shot
+        // count while waiting for completion tickets to permit write().
         if (ready_ || captured_ >= wanted_)
             return;
 
+        if (!beforeShots_.empty() &&
+            (!sameShape(before->GetDesc(), beforeDesc_) || !sameShape(after->GetDesc(), afterDesc_)))
+        {
+            // Abort this run without freeing its pending copies. write() rearms after completion.
+            shapeChanged_ = true;
+            ready_ = true;
+            return;
+        }
+
         if (!ensure(device, before, after))
         {
-            active_ = false;
+            release(); // allocation failed before any copies were recorded
             return;
         }
 
@@ -85,6 +93,10 @@ class FrameCapture
             return;
         }
 
+        auto use = DlssNr::GpuSafety::Record(cmd);
+        if (!use) return;
+        beforeShots_[captured_].use = use;
+        afterShots_[captured_].use = use;
         copy(cmd, before, beforeState, beforeShots_[captured_]);
         copy(cmd, after, afterState, afterShots_[captured_]);
         ++captured_;
@@ -93,15 +105,33 @@ class FrameCapture
             ready_ = true;
     }
 
-    // True once every frame has been copied and the GPU has been waited for. The caller does the waiting,
-    // since it owns the fence.
-    bool readyToWrite() const { return ready_; }
+    // Poll without blocking: all old copies must be complete or canceled, and no longer replayable.
+    bool readyToWrite() const
+    {
+        if (!ready_) return false;
+        for (unsigned int i = 0; i < captured_; ++i)
+            if (!DlssNr::GpuSafety::Reusable(beforeShots_[i].use) ||
+                !DlssNr::GpuSafety::Reusable(afterShots_[i].use)) return false;
+        return true;
+    }
 
     // Writes what was captured and releases everything. Returns the directory, or an empty string.
     std::string write(const std::filesystem::path& directory)
     {
-        if (!ready_)
+        if (!readyToWrite())
             return {};
+
+        bool discarded = shapeChanged_;
+        for (unsigned int i = 0; i < captured_; ++i)
+            discarded = discarded || !DlssNr::GpuSafety::Readable(beforeShots_[i].use) ||
+                        !DlssNr::GpuSafety::Readable(afterShots_[i].use);
+        if (discarded)
+        {
+            const auto frames = wanted_;
+            release();
+            request(frames);
+            return {};
+        }
 
         // A dark frame -- a menu, a loading screen -- measures nothing. Discard the run and quietly
         // re-arm for the same length, so the set that finally lands is of actual gameplay.
@@ -147,10 +177,25 @@ class FrameCapture
     }
 
   private:
+    bool shapeChanged_ = false;
+    static bool sameShape(D3D12_RESOURCE_DESC actual, const D3D12_RESOURCE_DESC& expected)
+    {
+        return actual.Dimension == expected.Dimension && actual.Width == expected.Width &&
+               actual.Height == expected.Height && actual.DepthOrArraySize == expected.DepthOrArraySize &&
+               actual.MipLevels == expected.MipLevels && actual.SampleDesc.Count == expected.SampleDesc.Count &&
+               actual.SampleDesc.Quality == expected.SampleDesc.Quality && TypedForCopy(actual.Format) == expected.Format;
+    }
     bool ensure(ID3D12Device* device, ID3D12Resource* before, ID3D12Resource* after)
     {
         if (!beforeShots_.empty())
             return true;
+
+        for (auto* source : {before, after})
+        {
+            const auto d = source->GetDesc();
+            if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.DepthOrArraySize != 1 ||
+                d.MipLevels != 1 || d.SampleDesc.Count != 1) return false;
+        }
 
         beforeShots_.resize(wanted_);
         afterShots_.resize(wanted_);

@@ -46,7 +46,7 @@ unsigned int Run(ID3D12GraphicsCommandList* cmdList, ID3D12Device* device, ID3D1
                  unsigned int guideHeight, bool depthInverted, bool reset, float mvScaleX,
                  float mvScaleY);
 
-// Drops the feature and its parameter block, for a resolution change or shutdown.
+// Retires the feature and its parameter block without freeing pending GPU references.
 void Release();
 // Ends the NGX generation, including retry and parameter-discovery state.
 void Shutdown();

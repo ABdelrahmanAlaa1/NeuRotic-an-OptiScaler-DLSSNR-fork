@@ -5,7 +5,7 @@
 
 #include <include/d3dx/d3dx12.h>
 
-GpuTime_Dx12::GpuTime_Dx12(ID3D12Device* device)
+GpuTime_Dx12::GpuTime_Dx12(ID3D12Device* device, bool completionTracked) : _completionTracked(completionTracked)
 {
     // Create query heap for Start and End timestamps per buffer
     D3D12_QUERY_HEAP_DESC queryHeapDesc = {};
@@ -46,9 +46,20 @@ GpuTime_Dx12::~GpuTime_Dx12()
 
 void GpuTime_Dx12::Start(ID3D12GraphicsCommandList* cmdList)
 {
+    _recording = false;
     if (_init && _queryHeap != nullptr)
     {
-        _currentFrameIndex = (_currentFrameIndex + 1) % QUERY_BUFFER_COUNT;
+        const int next = (_currentFrameIndex + 1) % QUERY_BUFFER_COUNT;
+        if (_completionTracked)
+        {
+            if (!DlssNr::GpuSafety::Reusable(_use[next])) return;
+            auto use = DlssNr::GpuSafety::Record(cmdList);
+            if (!use) return;
+            _use[next] = use;
+        }
+        _currentFrameIndex = next;
+        _trigger[next] = false;
+        _recording = true;
 
         cmdList->EndQuery(_queryHeap, D3D12_QUERY_TYPE_TIMESTAMP, _currentFrameIndex * 2);
     }
@@ -56,7 +67,7 @@ void GpuTime_Dx12::Start(ID3D12GraphicsCommandList* cmdList)
 
 void GpuTime_Dx12::End(ID3D12GraphicsCommandList* cmdList)
 {
-    if (_init && _queryHeap != nullptr)
+    if (_init && _queryHeap != nullptr && _recording)
     {
         cmdList->EndQuery(_queryHeap, D3D12_QUERY_TYPE_TIMESTAMP, _currentFrameIndex * 2 + 1);
 
@@ -64,6 +75,7 @@ void GpuTime_Dx12::End(ID3D12GraphicsCommandList* cmdList)
                                   _currentFrameIndex * 2 * sizeof(UINT64));
 
         _trigger[_currentFrameIndex] = true;
+        _recording = false;
     }
 }
 
@@ -77,14 +89,28 @@ std::optional<double> GpuTime_Dx12::ReadGpuTime(ID3D12CommandQueue* commandQueue
     // Try to read the previous frame's timestamps
     uint32_t previousFrameIndex = (_currentFrameIndex + 1) % QUERY_BUFFER_COUNT;
 
+    if (_completionTracked)
+    {
+        bool found = false;
+        for (int i = 0; i < QUERY_BUFFER_COUNT; ++i)
+        {
+            const auto slot = (previousFrameIndex + i) % QUERY_BUFFER_COUNT;
+            if (_trigger[slot] && DlssNr::GpuSafety::Readable(_use[slot]))
+            { previousFrameIndex = slot; found = true; break; }
+        }
+        if (!found) return elapsedTimeMs;
+    }
+
     if (!_trigger[previousFrameIndex])
         return elapsedTimeMs;
+    if (_completionTracked) _trigger[previousFrameIndex] = false;
 
     UINT64* timestampData {};
 
     // Tell it which timestamps we will be reading
     D3D12_RANGE readRange = { previousFrameIndex * 2 * sizeof(UINT64), (previousFrameIndex * 2 + 2) * sizeof(UINT64) };
-    _readbackBuffer->Map(0, &readRange, reinterpret_cast<void**>(&timestampData));
+    if (FAILED(_readbackBuffer->Map(0, &readRange, reinterpret_cast<void**>(&timestampData))))
+        return elapsedTimeMs;
 
     // CPU doesn't write anything
     D3D12_RANGE writeRange = { 0, 0 };
@@ -92,8 +118,14 @@ std::optional<double> GpuTime_Dx12::ReadGpuTime(ID3D12CommandQueue* commandQueue
     if (timestampData != nullptr)
     {
         // Get the GPU timestamp frequency (ticks per second)
-        UINT64 gpuFrequency;
-        commandQueue->GetTimestampFrequency(&gpuFrequency);
+        UINT64 gpuFrequency = 0;
+        if (_completionTracked) gpuFrequency = DlssNr::GpuSafety::TimestampFrequency(_use[previousFrameIndex]);
+        else if (commandQueue != nullptr) commandQueue->GetTimestampFrequency(&gpuFrequency);
+        if (gpuFrequency == 0)
+        {
+            _readbackBuffer->Unmap(0, &writeRange);
+            return elapsedTimeMs;
+        }
 
         // Calculate elapsed time in milliseconds
         UINT64 startTime = timestampData[previousFrameIndex * 2];

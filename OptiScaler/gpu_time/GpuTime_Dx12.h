@@ -1,6 +1,7 @@
 #pragma once
 #include "SysUtils.h"
 #include <d3d12.h>
+#include <dlssnr/NrGpuSafety.h>
 
 class GpuTime_Dx12
 {
@@ -12,9 +13,12 @@ class GpuTime_Dx12
 
     int _currentFrameIndex = 0;
     bool _init = false;
+    bool _completionTracked = false;
+    bool _recording = false;
+    DlssNr::GpuSafety::Ticket _use[QUERY_BUFFER_COUNT];
 
   public:
-    GpuTime_Dx12(ID3D12Device* device);
+    GpuTime_Dx12(ID3D12Device* device, bool completionTracked = false);
     ~GpuTime_Dx12();
 
     void Start(ID3D12GraphicsCommandList* cmdList);

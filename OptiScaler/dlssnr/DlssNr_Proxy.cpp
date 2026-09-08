@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "DlssNr_Proxy.h"
+#include "NrGpuSafety.h"
 
 
 #include <Config.h>
@@ -90,6 +91,28 @@ struct ProxyState
 
 ProxyState g_proxy;
 
+struct RetiredProxy
+{
+    NVSDK_NGX_Handle* feature;
+    NVSDK_NGX_Parameter* params;
+    DlssNr::GpuSafety::CompletionSet completion;
+};
+std::vector<RetiredProxy> g_retired;
+
+// The caller holds the NR lifecycle/render locks. Shutdown calls this only after its GPU drain.
+void CollectRetired(bool shutdown = false)
+{
+    for (auto it = g_retired.begin(); it != g_retired.end();)
+    {
+        if (!shutdown && !DlssNr::GpuSafety::Reusable(it->completion)) { ++it; continue; }
+        if (it->feature != nullptr && NVNGXProxy::D3D12_ReleaseFeature() != nullptr)
+            NVNGXProxy::D3D12_ReleaseFeature()(it->feature);
+        if (it->params != nullptr && NVNGXProxy::D3D12_DestroyParameters() != nullptr)
+            NVNGXProxy::D3D12_DestroyParameters()(it->params);
+        it = g_retired.erase(it);
+    }
+}
+
 // Everything the model reads when the feature is built.
 //
 // These have to be set before create, not at evaluate. The model reads its tuning once, while
@@ -135,13 +158,9 @@ bool Available()
 
 void Release()
 {
-    if (g_proxy.feature != nullptr && NVNGXProxy::D3D12_ReleaseFeature() != nullptr)
-        NVNGXProxy::D3D12_ReleaseFeature()(g_proxy.feature);
-
-    // GetCapabilityParameters returns a caller-owned block. Destroy it after its feature, while
-    // the NGX core is still initialized.
-    if (g_proxy.params != nullptr && NVNGXProxy::D3D12_DestroyParameters() != nullptr)
-        NVNGXProxy::D3D12_DestroyParameters()(g_proxy.params);
+    // Preserve both objects until every referencing recording is complete and invalidated.
+    if (g_proxy.feature != nullptr || g_proxy.params != nullptr)
+        g_retired.push_back({g_proxy.feature, g_proxy.params, GpuSafety::Pending()});
 
     g_proxy.feature = nullptr;
     g_proxy.params = nullptr;
@@ -153,6 +172,7 @@ void Release()
 void Shutdown()
 {
     Release();
+    CollectRetired(true);
     g_proxy = {};
 }
 
@@ -162,6 +182,9 @@ unsigned int Run(ID3D12GraphicsCommandList* cmdList, ID3D12Device* device, ID3D1
                  unsigned int guideHeight, bool depthInverted, bool reset, float mvScaleX,
                  float mvScaleY)
 {
+    CollectRetired();
+    if (g_retired.size() >= 32 || !GpuSafety::Record(cmdList))
+        return 0;
     if (g_proxy.failed || !Available())
         return 0;
 
@@ -185,7 +208,7 @@ unsigned int Run(ID3D12GraphicsCommandList* cmdList, ID3D12Device* device, ID3D1
             g_proxy.params == nullptr)
         {
             g_proxy.failed = true;
-            g_proxy.params = nullptr;
+            Release();
             LOG_ERROR("DLSS-NR (proxy): the NGX core refused its capability parameters");
             return 0;
         }
@@ -237,7 +260,7 @@ unsigned int Run(ID3D12GraphicsCommandList* cmdList, ID3D12Device* device, ID3D1
         if (created != NVSDK_NGX_Result_Success || g_proxy.feature == nullptr)
         {
             g_proxy.failed = true;
-            g_proxy.feature = nullptr;
+            Release();
             LOG_ERROR("DLSS-NR (proxy): CreateFeature(18) failed 0x{:X} -- falling back is the "
                       "caller's decision",
                       (unsigned int) created);

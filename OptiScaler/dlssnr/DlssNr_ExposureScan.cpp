@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include "NrGpuSafety.h"
 #include <mutex>
 #include <string>
 
@@ -64,6 +65,12 @@ struct ScanState
     unsigned int examined = 0;
     std::vector<Tracked> tracked;
     ID3D12Resource* readback[kSlots] = {};
+    DlssNr::GpuSafety::Ticket readbackUse[kSlots];
+    // Identity only: do not extend foreign placed-resource lifetime beyond the existing
+    // ReleaseTrackedResources notification (the resource reference does not own its heap).
+    std::vector<ID3D12Resource*> slotSources[kSlots];
+    uint64_t sourceGeneration = 0;
+    uint64_t slotGeneration[kSlots] = {};
     unsigned long long frames = 0;
     const char* status = "not started";
     bool complained = false;
@@ -404,9 +411,14 @@ void Tick(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList)
         return;
     }
 
-    // Read the slot written four frames ago before overwriting it. Retired by now, so this reads
-    // mapped memory rather than waiting on the GPU.
-    if (g_scan.frames >= kSlots)
+    const auto slot = g_scan.frames % kSlots;
+    if (!DlssNr::GpuSafety::Reusable(g_scan.readbackUse[slot])) return;
+    auto use = DlssNr::GpuSafety::Record(cmdList);
+    if (!use) return;
+
+    // Read only a completed copy, against the identities captured with that slot.
+    if (g_scan.frames >= kSlots && g_scan.slotGeneration[slot] == g_scan.sourceGeneration &&
+        DlssNr::GpuSafety::Readable(g_scan.readbackUse[slot]))
     {
         ID3D12Resource* old = g_scan.readback[g_scan.frames % kSlots];
         void* mapped = nullptr;
@@ -419,6 +431,8 @@ void Tick(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList)
             for (size_t i = 0; i < g_scan.tracked.size(); ++i)
             {
                 Tracked& t = g_scan.tracked[i];
+                if (i >= g_scan.slotSources[slot].size() ||
+                    g_scan.slotSources[slot][i] != t.resource) continue;
                 const unsigned char* at = base + i * kStride;
 
                 float value = 0.0f;
@@ -517,6 +531,11 @@ void Tick(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList)
 
     if (dst == nullptr)
         return;
+
+    g_scan.readbackUse[slot] = use;
+    g_scan.slotGeneration[slot] = g_scan.sourceGeneration;
+    g_scan.slotSources[slot].clear();
+    for (const auto& t : g_scan.tracked) g_scan.slotSources[slot].emplace_back(t.resource);
 
     // The state a candidate is in is the game's business and nothing here has a contract about it.
     //
@@ -955,6 +974,7 @@ std::string SerializeAnchors()
 void ReleaseTrackedResources()
 {
     std::lock_guard<std::mutex> lock(g_scanMutex);
+    ++g_scan.sourceGeneration;
 
     for (Tracked& t : g_scan.tracked)
     {
@@ -985,6 +1005,8 @@ void Shutdown()
             g_scan.readback[i]->Release();
             g_scan.readback[i] = nullptr;
         }
+        g_scan.readbackUse[i].reset();
+        g_scan.slotSources[i].clear();
     }
 
     g_scan.frames = 0;

@@ -501,7 +501,11 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_Shutdown(void)
     // NR owns driver features, capability parameters, and device-bound scratch resources.
     // Release them while the native NGX core is still live so a later initialization cannot reuse a
     // stale generation.
-    DlssNr::Shutdown();
+    if (!DlssNr::Shutdown())
+    {
+        shutdown = false;
+        return NVSDK_NGX_Result_FAIL_PlatformError;
+    }
     State::Instance().nvngxDx12Inited = false;
 
     D3D12Device = nullptr;
@@ -552,7 +556,11 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_Shutdown1(ID3D12Device* InDevice)
 {
     shutdown = true;
     // Shutdown1 must release NR before either native NGX shutdown variant is invoked.
-    DlssNr::Shutdown();
+    if (!DlssNr::Shutdown())
+    {
+        shutdown = false;
+        return NVSDK_NGX_Result_FAIL_PlatformError;
+    }
     State::Instance().nvngxDx12Inited = false;
 
     if (State::Instance().activeFgNvngx != FGNvngxReplacement::None)

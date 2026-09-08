@@ -176,7 +176,7 @@ std::optional<double> LastGpuTime();
 void RequestCapture(unsigned int frames);
 bool CaptureInProgress();
 
-void Shutdown();
+bool Shutdown();
 // Reopens evaluation after an explicit host NGX initialization.
 void NotifyDeviceInit(ID3D12Device* device);
 } // namespace DlssNr

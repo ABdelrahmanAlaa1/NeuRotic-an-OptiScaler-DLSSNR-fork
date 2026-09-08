@@ -325,22 +325,18 @@ struct NrState
 
     // The white point meter.
     //
-    // A 64x64 grid of tile luminances, copied to a readback buffer and looked at a few frames later.
-    // Four buffers deep rather than one: the copy is recorded into the game's own command list and
-    // there is no fence here to wait on, so the only thing making a read safe is that the frame it
-    // came from is long retired. Three frames of distance is what the meter this replaces used.
-    //
-    // A stale read costs a slightly wrong float that the average below absorbs. A read of a buffer
-    // still being written would cost the same, which is why the value is smoothed rather than used
-    // raw.
+    // A 64x64 grid of tile luminances. Four slots retain independent completion tickets; neither
+    // CPU reads nor new copies may touch a slot until its old recording and GPU work are finished.
     ID3D12Resource* meter = nullptr;
     ID3D12Resource* meterReadback[4] = {};
+    DlssNr::GpuSafety::Ticket meterUse[4];
 
     // The calibration grid: what scale the game's buffer is on, measured from the untouched copy.
     // Its own surface and ring rather than sharing the meter's, because the two run at different
     // sizes -- the meter fetches one texel and this reads the whole frame.
     ID3D12Resource* calib = nullptr;
     ID3D12Resource* calibReadback[4] = {};
+    DlssNr::GpuSafety::Ticket calibUse[4];
     unsigned long long calibFrames = 0;
 
     // The last few answers, so the menu can say how settled the number is. A suggestion taken during
@@ -578,10 +574,6 @@ void RecordTransitionFailure(TransitionFailureCircuit& circuit, const PreSrSigna
              signature.outputHeight, signature.workWidth, signature.workHeight,
              signature.perfQuality, circuit.failures + 1u, kTransitionFailureLimit, delayMs);
 }
-
-// A capture requested from outside the game: when the render path has no fence of its own, the write
-// waits until this frame count, by which point the GPU is certainly past the copies.
-unsigned long long g_captureWriteAtFrame = 0;
 
 // Dropping a file named dlssnr-capture.trigger beside OptiScaler requests a capture, so a session can
 // be asked for one from outside the game -- no alt-tab, no menu. Checked once a second, effectively.
@@ -915,15 +907,14 @@ void DiscoverFloatSlot(NVSDK_NGX_Parameter* params)
 // clamps linear HDR into an 8-bit texture -- wrong brightness until something forces a rebuild -- or
 // hands CopyResource mismatched formats, which fails silently and makes the whole pass appear to do
 // nothing. So the set is torn down whenever the format it was built for is not the format needed now.
-// Retired model features and surfaces are parked and freed a comfortable number of evaluates later.
-// Releasing them immediately was the device hang: with frame generation the GPU runs several frames
-// behind, this work rides the game's own queue that no module fence covers, and an NGX feature or
-// scratch texture freed under in-flight work kills the device.
+// Retired features/surfaces/scalers retain a snapshot of all live NR recordings. Reclaim only after
+// those recordings cannot be replayed and their actual submitting queues have completed them.
 struct NrRetired
 {
     void* feature = nullptr;
     ID3D12Resource* resource = nullptr;
-    int framesLeft = 32;
+    OS_Dx12* scaler = nullptr;
+    DlssNr::GpuSafety::CompletionSet completion = DlssNr::GpuSafety::Pending();
 };
 
 std::vector<NrRetired> g_nrRetired;
@@ -954,7 +945,7 @@ void TickNrRetired()
 {
     for (size_t i = 0; i < g_nrRetired.size();)
     {
-        if (--g_nrRetired[i].framesLeft > 0)
+        if (!DlssNr::GpuSafety::Reusable(g_nrRetired[i].completion))
         {
             ++i;
             continue;
@@ -965,6 +956,8 @@ void TickNrRetired()
 
         if (g_nrRetired[i].resource != nullptr)
             g_nrRetired[i].resource->Release();
+
+        delete g_nrRetired[i].scaler;
 
         g_nrRetired.erase(g_nrRetired.begin() + i);
     }
@@ -1034,6 +1027,11 @@ void CopyCalibrationToReadback(ID3D12GraphicsCommandList* cmdList)
     if (g_nr.calibReadback[slot] == nullptr || g_nr.calib == nullptr)
         return;
 
+    if (!DlssNr::GpuSafety::Reusable(g_nr.calibUse[slot])) return;
+    auto use = DlssNr::GpuSafety::Record(cmdList);
+    if (!use) return;
+    g_nr.calibUse[slot] = use;
+
     D3D12_TEXTURE_COPY_LOCATION srcLoc {};
     srcLoc.pResource = g_nr.calib;
     srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -1063,6 +1061,11 @@ void CopyMeterToReadback(ID3D12GraphicsCommandList* cmdList, ID3D12Device* devic
 
     if (g_nr.meterReadback[slot] == nullptr)
         return;
+
+    if (!DlssNr::GpuSafety::Reusable(g_nr.meterUse[slot])) return;
+    auto use = DlssNr::GpuSafety::Record(cmdList);
+    if (!use) return;
+    g_nr.meterUse[slot] = use;
 
     // Travels with the grid: read back three frames from now, alongside the tiles it describes.
     g_nr.meterExposureValid[slot] = exposureBound;
@@ -1108,7 +1111,7 @@ void ConsumeCalibrationReadback()
     const unsigned int slot = (unsigned int) (g_nr.calibFrames % 4);
     ID3D12Resource* buffer = g_nr.calibReadback[slot];
 
-    if (buffer == nullptr)
+    if (buffer == nullptr || !DlssNr::GpuSafety::Readable(g_nr.calibUse[slot]))
         return;
 
     void* mapped = nullptr;
@@ -1205,7 +1208,7 @@ void ConsumeMeterReadback()
     const unsigned int slot = (unsigned int) (g_nr.meterFrames % 4);
     ID3D12Resource* buffer = g_nr.meterReadback[slot];
 
-    if (buffer == nullptr)
+    if (buffer == nullptr || !DlssNr::GpuSafety::Readable(g_nr.meterUse[slot]))
         return;
 
     void* mapped = nullptr;
@@ -1743,6 +1746,13 @@ DlssNr_Dx12::DlssNr_Dx12(std::string InName, ID3D12Device* InDevice)
     _init = InitHeaps(InDevice, _frameHeaps, DLSSNR_NUM_OF_HEAPS);
 }
 
+bool DlssNr_Dx12::HasFreeSlots(unsigned int count) const
+{
+    for (const auto& use : _slotUse)
+        if (DlssNr::GpuSafety::Reusable(use) && --count == 0) return true;
+    return false;
+}
+
 bool DlssNr_Dx12::DispatchPass(ID3D12GraphicsCommandList* InCmdList, const DlssNrConstants& InConstants,
                                   ID3D12Resource* InSource, ID3D12Resource* InModel,
                                   ID3D12Resource* InOriginal, ID3D12Resource* InMotion,
@@ -1752,8 +1762,17 @@ bool DlssNr_Dx12::DispatchPass(ID3D12GraphicsCommandList* InCmdList, const DlssN
     if (!_init || InCmdList == nullptr || _device == nullptr || InSource == nullptr || OutTarget == nullptr)
         return false;
 
-    const uint32_t slot = _heapIndex;
-    _heapIndex = (_heapIndex + 1) % DLSSNR_NUM_OF_HEAPS;
+    auto use = DlssNr::GpuSafety::Record(InCmdList);
+    if (!use) return false;
+    uint32_t slot = _heapIndex;
+    for (uint32_t tried = 0; tried < DLSSNR_NUM_OF_HEAPS; ++tried)
+    {
+        slot = (_heapIndex + tried) % DLSSNR_NUM_OF_HEAPS;
+        if (DlssNr::GpuSafety::Reusable(_slotUse[slot])) break;
+        if (tried + 1 == DLSSNR_NUM_OF_HEAPS) return false;
+    }
+    _heapIndex = (slot + 1) % DLSSNR_NUM_OF_HEAPS;
+    _slotUse[slot] = use;
 
     FrameDescriptorHeap& currentHeap = _frameHeaps[slot];
 
@@ -1802,6 +1821,11 @@ bool DlssNr_Dx12::DispatchPass(ID3D12GraphicsCommandList* InCmdList, const DlssN
 
 DlssNr_Dx12::~DlssNr_Dx12()
 {
+    // The base class skips cleanup after partial initialization or process-shutdown signaling.
+    // NR reaches this destructor only before recording or after its completion drain.
+    SAFE_RELEASE(_pipelineState);
+    SAFE_RELEASE(_rootSignature);
+    SAFE_RELEASE(_constantBuffer);
     for (auto& buffer : _constantBuffers)
     {
         if (buffer != nullptr)
@@ -1823,6 +1847,15 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         motion == nullptr || output == nullptr)
     {
         ReportSkipOnce(g_nr.failed ? "it already failed this session" : "a resource was missing");
+        return;
+    }
+
+    // Enough for meter/encode/downsample/resolve and the optional Pre-SR re-jitter. If the
+    // bounded pool is busy, bypass this NR evaluation before recording output transitions.
+    if (!DlssNr::GpuSafety::Record(cmdList) || !HasFreeSlots(8))
+    {
+        g_nr.reset = true;
+        ReportSkipOnce("GPU completion pending or command-list tracking unavailable");
         return;
     }
 
@@ -2191,9 +2224,8 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     TickNrRetired();
     CheckCaptureTrigger();
 
-    if (g_captureWriteAtFrame != 0 && g_frames >= g_captureWriteAtFrame)
+    if (g_capture.readyToWrite())
     {
-        g_captureWriteAtFrame = 0;
         const auto captureDir = Util::DllPath().remove_filename() / "dlssnr-capture";
         const auto written = g_capture.write(captureDir);
 
@@ -2236,10 +2268,10 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     ScopedNrStateEnvelope stateEnvelope(cmdList);
 
     if (g_gpuTime == nullptr)
-        g_gpuTime = std::make_unique<GpuTime_Dx12>(device);
+        g_gpuTime = std::make_unique<GpuTime_Dx12>(device, true);
 
     if (g_ngxTime == nullptr)
-        g_ngxTime = std::make_unique<GpuTime_Dx12>(device);
+        g_ngxTime = std::make_unique<GpuTime_Dx12>(device, true);
 
     if (g_gpuTime != nullptr)
         g_gpuTime->Start(cmdList);
@@ -2465,8 +2497,14 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             const Scaler nrScaler = cfg.DlssNrScalingDownscaler.value_or_default();
             if (g_nr.nrScaler != nrScaler)
             {
-                if (g_nr.superUp != nullptr)   { delete g_nr.superUp;   g_nr.superUp = nullptr; }
-                if (g_nr.superDown != nullptr) { delete g_nr.superDown; g_nr.superDown = nullptr; }
+                for (auto** scaler : { &g_nr.superUp, &g_nr.superDown })
+                {
+                    if (*scaler == nullptr) continue;
+                    NrRetired retired;
+                    retired.scaler = *scaler;
+                    g_nrRetired.push_back(std::move(retired));
+                    *scaler = nullptr;
+                }
                 g_nr.nrScaler = nrScaler;
             }
             if (g_nr.superUp == nullptr)
@@ -2757,17 +2795,13 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
         // On-demand capture works in this path too: the staging copy still holds the frame as the
-        // upscaler produced it, and the edited frame is the output itself. The write happens a few
-        // frames later, once the GPU is certainly past these copies -- this path has no fence of its
-        // own.
+        // upscaler produced it, and the edited frame is the output itself. A later evaluation writes
+        // the capture only after its recording tickets confirm completion, never by frame age.
         if (g_capture.isActive())
         {
             g_capture.record(cmdList, device, g_nr.colorCopy,
                              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, target,
                              D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-
-            if (g_capture.readyToWrite() && g_captureWriteAtFrame == 0)
-                g_captureWriteAtFrame = g_frames + 8;
         }
     }
     else
@@ -2900,7 +2934,7 @@ struct PreDlaaRetired
 {
     NVSDK_NGX_Handle* feature = nullptr;
     ID3D12Resource* output = nullptr;
-    int framesLeft = 64;
+    GpuSafety::CompletionSet completion = GpuSafety::Pending();
 };
 
 std::vector<PreDlaaRetired> g_preDlaaRetired;
@@ -2911,7 +2945,7 @@ void TickPreDlaaRetired()
 
     for (size_t i = 0; i < g_preDlaaRetired.size();)
     {
-        if (--g_preDlaaRetired[i].framesLeft > 0)
+        if (!GpuSafety::Reusable(g_preDlaaRetired[i].completion))
         {
             ++i;
             continue;
@@ -2961,6 +2995,7 @@ ID3D12Resource* EvaluatePreDlaa(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Pa
                                 ID3D12Resource* color, ID3D12Device* device)
 {
     TickPreDlaaRetired();
+    if (g_preDlaaRetired.size() >= 32) return nullptr;
 
     if (cmdList == nullptr || params == nullptr || color == nullptr || device == nullptr)
         return nullptr;
@@ -3161,6 +3196,10 @@ ID3D12Resource* EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_
     if (!cfg.DlssNrEnabled.value_or_default() || !cfg.DlssNrRunBeforeSr.value_or_default() ||
         cmdList == nullptr || params == nullptr)
         return nullptr;
+
+    if (!GpuSafety::Record(cmdList)) return nullptr;
+    TickNrRetired();
+    if (g_nrRetired.size() >= 128) return nullptr;
 
     if (cfg.OutputResourceBarrier.has_value())
         return nullptr;
@@ -3652,6 +3691,10 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
     if (Config::Instance()->DlssNrRunBeforeSr.value_or_default() && !forceAfterUpscale)
         return;
 
+    if (!GpuSafety::Record(cmdList)) return;
+    TickNrRetired();
+    if (g_nrRetired.size() >= 128) return;
+
     // Which of the game's APIs this evaluate arrived through.
     //
     // Says out loud what was previously only reasoned about: an FSR or XeSS title reaches this pass
@@ -4107,13 +4150,25 @@ void RequestCapture(unsigned int frames)
 
 bool CaptureInProgress() { return g_capture.isActive(); }
 
-void Shutdown()
+bool Shutdown()
 {
     std::lock_guard<std::recursive_mutex> lifecycleLock(g_lifecycleMutex);
     std::lock_guard<std::mutex> nrLock(g_nrMutex);
     if (g_sessionClosed)
-        return;
+        return !g_shutdownFailed;
     g_sessionClosed = true;
+
+    if (!GpuSafety::Drain(2000))
+    {
+        g_shutdownFailed = true;
+        // Keep the owning shader/timer destructors from running during DLL static teardown.
+        // The failed generation is intentionally retained until process exit.
+        g_compose.release();
+        g_gpuTime.release();
+        g_ngxTime.release();
+        LOG_ERROR("DLSS-NR shutdown: GPU work is unsubmitted, incomplete, or lost; retaining the generation and blocking native NGX teardown/restart");
+        return false;
+    }
 
     ReleasePrivateCreateKit();
     Proxy::Shutdown();
@@ -4147,6 +4202,7 @@ void Shutdown()
 
         if (r.resource != nullptr)
             r.resource->Release();
+        delete r.scaler;
     }
 
     g_nrRetired.clear();
@@ -4263,6 +4319,8 @@ void Shutdown()
 
     g_nr.calibFrames = 0;
     g_nr.calibCount = 0;
+    for (auto& use : g_nr.calibUse) use.reset();
+    for (auto& use : g_nr.meterUse) use.reset();
     g_nr.calibSuggestion = 0.0f;
     g_nr.calibSteadiness = 0.0f;
     g_nr.calibUsable = false;
@@ -4336,12 +4394,13 @@ void Shutdown()
     g_nr.reason = "";
     g_nr.reset = true;
     g_nr.width = g_nr.height = g_nr.workWidth = g_nr.workHeight = 0;
-    g_captureWriteAtFrame = 0;
     if (g_generationDevice != nullptr)
     {
         g_generationDevice->Release();
         g_generationDevice = nullptr;
     }
+    GpuSafety::NewSession();
+    return !g_shutdownFailed;
 }
 
 void NotifyDeviceInit(ID3D12Device* device)

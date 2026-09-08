@@ -23,9 +23,6 @@ using Microsoft::WRL::ComPtr;
 
 #include <Config.h>
 
-static Constants constants {};
-static UpscaleShaderConstants fsr1Constants {};
-
 #pragma warning(disable : 4244)
 
 bool OS_Dx12::CreateBufferResource(ID3D12Device* InDevice, ID3D12Resource* InSource, uint32_t InWidth,
@@ -58,11 +55,29 @@ bool OS_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
 
     LOG_DEBUG("[{0}] Start!", _name);
 
+    Constants constants {};
+    UpscaleShaderConstants fsr1Constants {};
+
+    FrameDescriptorHeap* heap = nullptr;
+    ID3D12Resource* constantBuffer = _constantBuffer;
+    if (_nrHeaps)
+    {
+        auto use = DlssNr::GpuSafety::Record(InCmdList);
+        if (!use) return false;
+        unsigned int slot = 0;
+        for (; slot < kNrSlots; ++slot)
+            if (DlssNr::GpuSafety::Reusable(_nrUse[slot])) break;
+        if (slot == kNrSlots) return false;
+        _nrUse[slot] = use;
+        heap = &_nrHeaps[slot];
+        constantBuffer = _nrConstants[slot];
+    }
+
     ScopedGpuTime_Dx12 scopedGpuTime(GpuTime.get(), InCmdList);
 
     _counter++;
     _counter = _counter % OS_NUM_OF_HEAPS;
-    FrameDescriptorHeap& currentHeap = _frameHeaps[_counter];
+    FrameDescriptorHeap& currentHeap = heap ? *heap : _frameHeaps[_counter];
 
     CreateShaderResourceView(_device, InResource, currentHeap.GetSrvCPU(0));
     CreateUnorderedAccessView(_device, OutResource, currentHeap.GetUavCPU(0), 0);
@@ -90,11 +105,11 @@ bool OS_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
     if (ActiveScaler() == Scaler::FSR1)
     {
         createdConstantsBuffer =
-            CreateConstantsBuffer(_device, _constantBuffer, fsr1Constants, currentHeap.GetCbvCPU(0));
+            CreateConstantsBuffer(_device, constantBuffer, fsr1Constants, currentHeap.GetCbvCPU(0));
     }
     else
     {
-        createdConstantsBuffer = CreateConstantsBuffer(_device, _constantBuffer, constants, currentHeap.GetCbvCPU(0));
+        createdConstantsBuffer = CreateConstantsBuffer(_device, constantBuffer, constants, currentHeap.GetCbvCPU(0));
     }
 
     if (!createdConstantsBuffer)
@@ -143,6 +158,19 @@ OS_Dx12::OS_Dx12(std::string InName, ID3D12Device* InDevice, bool InUpsample, Sc
     {
         LOG_ERROR("InDevice is nullptr!");
         return;
+    }
+
+    if (_scalerOverride != Scaler::Count)
+    {
+        // NR opts into fenced descriptor/constant slots. Ordinary Output Scaling keeps its path.
+        GpuTime = std::make_unique<GpuTime_Dx12>(InDevice, true);
+        _nrHeaps = std::make_unique<FrameDescriptorHeap[]>(kNrSlots);
+        static_assert(sizeof(Constants) <= 256 && sizeof(UpscaleShaderConstants) <= 256);
+        auto nrDesc = CD3DX12_RESOURCE_DESC::Buffer(256);
+        auto nrHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
+        for (auto& buffer : _nrConstants)
+            if (FAILED(InDevice->CreateCommittedResource(&nrHeap, D3D12_HEAP_FLAG_NONE, &nrDesc,
+                         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&buffer)))) return;
     }
 
     LOG_DEBUG("{0} start!", _name);
@@ -245,11 +273,20 @@ OS_Dx12::OS_Dx12(std::string InName, ID3D12Device* InDevice, bool InUpsample, Sc
         return;
     }
 
-    _init = InitHeaps(InDevice, _frameHeaps, OS_NUM_OF_HEAPS);
+    _init = _nrHeaps ? InitHeaps(InDevice, _nrHeaps.get(), kNrSlots)
+                    : InitHeaps(InDevice, _frameHeaps, OS_NUM_OF_HEAPS);
 }
 
 OS_Dx12::~OS_Dx12()
 {
+    for (auto& buffer : _nrConstants) SAFE_RELEASE(buffer);
+    if (_nrHeaps)
+    {
+        SAFE_RELEASE(_pipelineState);
+        SAFE_RELEASE(_rootSignature);
+        SAFE_RELEASE(_constantBuffer);
+        SAFE_RELEASE(_buffer);
+    }
     if (!_init || State::Instance().isShuttingDown)
         return;
 
