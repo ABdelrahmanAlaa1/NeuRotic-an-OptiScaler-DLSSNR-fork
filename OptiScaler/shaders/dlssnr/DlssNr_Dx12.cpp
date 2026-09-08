@@ -403,6 +403,10 @@ struct NrState
     unsigned int height = 0;
     bool reset = true;
     uint64_t resumeGeneration = 0;
+    // Feature 18 faulted the driver when a long-lived RR -> NR session was reset in place after
+    // re-enable. Keep the exact retired handle so a replacement cannot be created until the GPU
+    // completion snapshot protecting this one has drained and the vendor release has run.
+    void* resumeFeatureAwaitingRelease = nullptr;
 
     // Dimensions of the guides as the upscaler handed them over, kept for the present path, which runs
     // long after that call has returned.
@@ -957,6 +961,9 @@ void TickNrRetired()
 
         if (g_nrRetired[i].feature != nullptr && g_nr.release != nullptr)
             g_nr.release(g_nrRetired[i].feature);
+
+        if (g_nrRetired[i].feature == g_nr.resumeFeatureAwaitingRelease)
+            g_nr.resumeFeatureAwaitingRelease = nullptr;
 
         if (g_nrRetired[i].resource != nullptr)
             g_nrRetired[i].resource->Release();
@@ -1865,8 +1872,23 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     {
         g_nr.resumeGeneration = runtime.resumeGeneration;
         g_nr.reset = true;
-        LOG_INFO("DLSS-NR: enable transition {} applied at the D3D12 render boundary; temporal reset requested",
-                 runtime.resumeGeneration);
+
+        // An Event 153 driver fault was captured on the first work submitted after resetting a
+        // retained, long-running Feature 18 session. Do not ask that opaque temporal object to reset
+        // in place. Retire it against the recordings that can still reference it, then create a fresh
+        // session only after its vendor release is safe. Scratch/resources remain live and reusable.
+        if (g_nr.feature != nullptr)
+        {
+            g_nr.resumeFeatureAwaitingRelease = g_nr.feature;
+            ParkNrFeature(g_nr.feature);
+            LOG_INFO("DLSS-NR: enable transition {} retiring the previous model session before restart",
+                     runtime.resumeGeneration);
+        }
+        else
+        {
+            LOG_INFO("DLSS-NR: enable transition {} applied at the D3D12 render boundary; temporal reset requested",
+                     runtime.resumeGeneration);
+        }
     }
 
     // Enough for meter/encode/downsample/resolve and the optional Pre-SR re-jitter. If the
@@ -1875,6 +1897,17 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     {
         g_nr.reset = true;
         ReportSkipOnce("GPU completion pending or command-list tracking unavailable");
+        return;
+    }
+
+    // ParkNrFeature captured every known recording that could reference the old session, including
+    // the current invocation if its outer call-site registration was first. The Record above cannot
+    // weaken that snapshot. Bypass without touching the output until vendor release has actually run;
+    // this also avoids overlapping two full-resolution model allocations.
+    TickNrRetired();
+    if (g_nr.resumeFeatureAwaitingRelease != nullptr)
+    {
+        ReportSkipOnce("the previous model session is still retiring after re-enable");
         return;
     }
 
@@ -2263,7 +2296,6 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     // of the game's exposure rather than a number worth asking anyone to guess: measured means of 0.065,
     // 1.8 and 185 have all been seen in this one game.
     ++g_frames;
-    TickNrRetired();
     CheckCaptureTrigger();
 
     if (g_capture.readyToWrite())
@@ -4308,6 +4340,7 @@ bool Shutdown()
     g_nr.preSrResetWasRequested = false;
     g_nr.preSrScratchPrimed = false;
     g_nr.successfulEvaluations = 0;
+    g_nr.resumeFeatureAwaitingRelease = nullptr;
     ClearTransitionFailure(g_nr.preSrFailureCircuit);
     ClearTransitionFailure(g_nr.preDlaaFailureCircuit);
 

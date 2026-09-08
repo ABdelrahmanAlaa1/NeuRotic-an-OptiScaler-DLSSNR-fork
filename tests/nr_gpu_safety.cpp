@@ -46,15 +46,25 @@ int main()
     Check(queue->Wait(gate.Get(), 1));
     auto pending = Safety::Record(list.Get());
     auto retirement = Safety::Pending();
+    bool retiredSessionReleased = false;
+    bool replacementSessionCreated = false;
     Check(list->Close());
     submit(queue.Get());
     Check(list->Reset(nextAllocator.Get(), nullptr)); // list Reset is legal while old work runs
     for (int i = 0; i < 1000; ++i)
-        assert(!Safety::Reusable(pending) && !Safety::Readable(pending) && !Safety::Reusable(retirement));
+    {
+        if (Safety::Reusable(retirement)) retiredSessionReleased = true;
+        if (retiredSessionReleased) replacementSessionCreated = true;
+        assert(!Safety::Reusable(pending) && !Safety::Readable(pending) && !retiredSessionReleased &&
+               !replacementSessionCreated);
+    }
     assert(!Safety::Drain(1));
     Check(gate->Signal(1));
     assert(Safety::Drain(5000));
-    assert(Safety::Reusable(pending) && Safety::Readable(pending) && Safety::Reusable(retirement));
+    if (Safety::Reusable(retirement)) retiredSessionReleased = true;
+    if (retiredSessionReleased) replacementSessionCreated = true;
+    assert(Safety::Reusable(pending) && Safety::Readable(pending) && retiredSessionReleased &&
+           replacementSessionCreated);
     assert(Safety::TimestampFrequency(pending) > 0);
 
     auto replay = Safety::Record(list.Get());

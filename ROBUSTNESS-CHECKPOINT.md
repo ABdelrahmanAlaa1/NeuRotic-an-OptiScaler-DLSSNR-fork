@@ -94,3 +94,20 @@ launch. Status/timers or lack of a crash alone do not prove functioning NR.
 
 Result pending build/tests: Inconclusive. Decision: keep experimental pending the
 build-only gate and later user runtime evidence; no defaults/baseline promotion.
+
+## Runtime correction after the first deployment
+
+The first game test produced a confirmed `nvlddmkm` Event 153 at 07:35:20.566,
+immediately after enable generation 57 restarted NR on the native RR -> NR path.
+Generations 1-56 had completed, followed by roughly ten minutes of successful
+4K NR work. The OptiScaler log contains no model error or device-removal return;
+the driver faulted while processing submitted work.
+
+The correction no longer resets a retained Feature 18 temporal session in place
+after re-enable. It retires that exact handle under its existing GPU completion
+snapshot, waits without touching output until vendor release is safe, then creates
+a fresh model session. Scratch resources remain live. This costs one or more
+bypassed frames plus model-creation latency after each off -> on transition, but
+adds no steady-state work and avoids overlapping two full-resolution model
+allocations. Runtime validation remains required; this evidence narrows the fault
+boundary but does not provide a driver crash dump or internal NVIDIA fault address.
