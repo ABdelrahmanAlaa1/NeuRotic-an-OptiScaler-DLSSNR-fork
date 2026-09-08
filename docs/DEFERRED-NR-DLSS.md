@@ -6,7 +6,7 @@ select DLSS in the game/OptiScaler as well for a DLSS-on-both-branches compariso
 
 ## Enable
 
-Use a build containing this source change (not v0.6.2). Under **DLSS Neural Rendering**, enable
+Use v0.7.0 or a newer build containing this change (not v0.6.2). Under **DLSS Neural Rendering**, enable
 **Generate before SR, apply after SR (DLSS)**. It overrides, but does not erase, the existing
 **Apply before Super Resolution** checkbox. Or configure:
 

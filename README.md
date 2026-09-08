@@ -6,8 +6,8 @@
 The upstream fork already provided experimental direct access to NVIDIA DLSS Neural Rendering. This fork adds:
 
 - **Optional Neural Rendering before DLSS Super Resolution.** The model can process the DLSS input image—such as 1920x1080 in 4K Performance mode—before DLSS upscales it to the display resolution.
-- **Configurable multipass processing.** `[DlssNr] Passes=1..3` runs one, two, or three sequential neural evaluations. Each pass has independent persistent history; the final result is composed once against the original base image.
-- **Per-pass model profiles.** Passes 2 and 3 can inherit pass 1 or select their own built-in preset and style (`standard`, `natural`, or `cinematic`) without loading competing model DLLs.
+- **Configurable multipass processing.** `Passes=1..3` is the normal range; optional `UnlockPasses=true` lifts the ceiling to 30. Each pass has independent persistent history; the final result is composed once against the original base image. High counts can exhaust VRAM or trigger a driver timeout.
+- **Per-pass model profiles.** Later passes inherit pass 1 or select their own style (`standard`, `natural`, or `cinematic`) without loading competing model DLLs. Advanced preset hints have an unverified visual effect.
 - **Independent model strengths per pass.** Each pass has intensity, local structure, local tone,
   skin structure, and auto skin mask controls. Preset hints are grouped under a collapsed advanced
   section because their visual effect is unverified; style is the primary profile selector.
@@ -28,7 +28,10 @@ The upstream fork already provided experimental direct access to NVIDIA DLSS Neu
 
 Downloads:
 
-- [Latest release — v0.6.2](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases/tag/v0.6.2-swapchain-fixes) — rebuilt complete package including janblade's window-sized swapchain fix and the reviewed DirectComposition hook, plus the previous padded pre-SR and skin/MFG changes. Build and native API smoke-tested; in-game validation of the new hooks is pending. NVIDIA NR/FG runtimes are not bundled.
+- [FP8 / NVFP4 hybrid update � v0.7.1](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases/tag/v0.7.1-hybrid) � attempt at NVFP4 hybrid. VERY minor improvements on Blackwell. Removes async NR and fixes Streamline override startup crashes.
+
+- [Newest experimental package — v0.7.0 Vulkan/NR preview](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases/tag/v0.7.0-vulkan-preview) — complete rebuilt package with native Vulkan pre-SR/multipass, selected compatibility fixes, and optional D3D12 residual experiments. New options are off by default. Read the [scope and validation limits](docs/VULKAN-PARITY-REVIEW.md).
+- [Previous release / rollback — v0.6.2](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases/tag/v0.6.2-swapchain-fixes) — rebuilt complete package including janblade's window-sized swapchain fix and the reviewed DirectComposition hook, plus the previous padded pre-SR and skin/MFG changes. Build and native API smoke-tested; in-game validation of the new hooks is pending. NVIDIA NR/FG runtimes are not bundled.
 - [Per-pass controls preview](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases/tag/v0.5.0-pass-controls-preview) — reorganized pass sections and independent model strengths, including the RR controls. Runtime validation is pending.
 - [Native RR controls preview](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases/tag/v0.4.0-rr-preview) — compiled experimental build with independent NR-after-RR controls. In-game RR/NR validation is pending.
 - [Portable cross-generation package](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases/tag/v0.3.0-crossgen-portable) — the complete installer and backend layout, with game-neutral defaults and RTX 20/30/40/50 runtime guidance.
@@ -67,10 +70,10 @@ release. This supplies dependencies, not a guarantee of injected FG compatibilit
 
 ### New compatibility work (not yet game-validated)
 
-- Experimental source after v0.6.2: **Generate before SR, apply after SR (DLSS)** runs NR on a private
+- Included in the v0.7.0 preview: **Generate before SR, apply after SR (DLSS)** runs NR on a private
   render-size copy, upscales its signed contribution through a separate NVIDIA DLSS feature and applies
   it to the clean upscaled frame. [Setup, encoding and validation limits](docs/DEFERRED-NR-DLSS.md).
-  This is not in the existing v0.6.2 download and is not yet game-validated.
+  This remains experimental; see the linked notes for test coverage and game-specific limitations.
 
 - v0.6.2 incorporates janblade's NBA 2K26 window-sized swapchain fix, diagnostic
   logging and a reviewed DirectComposition hook. [Review and validation](docs/PR-2-REVIEW.md).
@@ -85,7 +88,17 @@ release. This supplies dependencies, not a guarantee of injected FG compatibilit
   is now inside the graphics-state restore envelope as well as evaluation.
 
 See [what changed, limitations and tests](docs/NR-COMPATIBILITY.md). These changes are not in the older
-v0.5 download listed above. The RTX 40 unlocker is a separate optional component, not enabled by default.
+v0.5 download listed above. v0.7.0 also includes an experimental built-in Ada unlock and an optional 30-pass limit, both off by default; [instructions and caveats](docs/VULKAN-PARITY-REVIEW.md). Do not combine the built-in and external unlockers.
+
+### Known issue: Aphelion HDR flicker / purple halos
+
+[Issue #3](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/issues/3) is **not fixed in v0.7.0**.
+The DLSS HDR override can also change NR's colour-space interpretation without converting the
+underlying colour buffer. This is a plausible cause of the reported purple halos, not a confirmed
+game-specific diagnosis. The original brightness flicker still needs exposure/format investigation.
+The reporter says switching dynamic resolution to fixed did not help. Please include the INI, log,
+game/driver versions and an NR-off comparison in further reports; do not treat disabling HDR as a
+general fix. No unverified HDR-decoupling change is included in this release.
 
 ### GPU and runtime compatibility
 
@@ -132,7 +145,7 @@ Implementation details and safety invariants are documented in [the pre-SR multi
 
 The implementation contains no BG3-specific executable names, offsets, or shaders. It is designed for 64-bit games whose DLSS Super Resolution call reaches OptiScaler's Direct3D 12 path, including its Direct3D 11/Vulkan-to-DX12 bridges. It has also run in Hogwarts Legacy and Cyberpunk 2077. Compatibility still depends on the game exposing valid colour, depth, motion-vector, resolution, and command-submission data through its upscaler integration.
 
-Ray Reconstruction deliberately uses the post-SR path. Native Vulkan currently retains the upstream post-SR implementation. Games with unusual loaders, multiple swapchains, non-zero colour offsets, invalid render rectangles, anti-cheat, or another `dxgi.dll` mod may need a different OptiScaler proxy name or will use the guarded post-SR fallback. Origin-zero allocation padding is supported on the DX12 pre-SR path and its bridges.
+Ray Reconstruction deliberately uses the post-SR path. v0.7.0 adds native Vulkan pre-SR and multipass NR, including origin-zero padded inputs; v0.6.2 does not contain these additions. Native Vulkan deferred/async residual modes remain unsupported. [Vulkan setup, adopted fork changes and validation limits](docs/VULKAN-PARITY-REVIEW.md). Games with unusual loaders, multiple swapchains, non-zero colour offsets, invalid render rectangles, anti-cheat, or another `dxgi.dll` mod may need a different OptiScaler proxy name or will use the guarded post-SR fallback.
 
 ---
 

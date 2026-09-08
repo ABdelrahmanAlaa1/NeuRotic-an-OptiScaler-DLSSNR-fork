@@ -512,11 +512,13 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     if (gMode == 6 || gMode == 10)
     {
         float4 base = gSource.Load(int3(id.xy, 0));
+#ifndef VK_MODE
         if (gMode == 10 && gExposure.Load(int3(0, 0, 0)).r > 0.0)
         {
             gTarget[id.xy] = base;
             return;
         }
+#endif
         float3 encoded = SanitizeFinite3(gModel.Load(int3(id.xy, 0)).rgb, 0.5);
         // Limit the inverse near its poles: DLSS can ring outside the carrier's [0,1] range.
         float3 signedEdit = clamp(2.0 * encoded - 1.0, -0.999, 0.999);

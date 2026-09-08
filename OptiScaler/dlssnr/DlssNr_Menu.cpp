@@ -196,7 +196,8 @@ void RenderMenu(Config* config, float menuResScale)
                    "\nIndependent controls below prevent inheriting the cost of the SR configuration."
                    "\nNative Vulkan does not use these DX12 controls.");
         int rrPasses = (int) config->DlssNrRRPasses.value_or_default();
-        if (ImGui::SliderInt("NR passes after RR", &rrPasses, 1, (int) MaxPassCount))
+        if (ImGui::SliderInt("NR passes after RR", &rrPasses, 1,
+                             (int) (config->DlssNrUnlockPasses.value_or_default() ? MaxPassCount : DefaultMaxPassCount)))
             config->DlssNrRRPasses = (unsigned int) rrPasses;
         float rrScale = config->DlssNrRRWorkingScale.value_or_default();
         if (ImGui::SliderFloat("NR model scale after RR", &rrScale, 0.25f, 2.0f, "%.2fx"))
@@ -233,15 +234,29 @@ void RenderMenu(Config* config, float menuResScale)
         }
         else if (!DlssNr::IsRunning() && !vulkan)
         {
-            const char* reason = DlssNr::FailureReason();
+            const auto feature = State::Instance().currentFeature;
+            const bool nativeVk = feature && feature->Api() == API::Vulkan && !feature->IsWithDx12();
+            const char* reason = nativeVk ? DlssNr::FailureReasonVk() : DlssNr::FailureReason();
 
             if (reason[0] != 0)
             {
                 ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.35f, 1.0f), "Off for this session: %s.", reason);
                 ImGui::SameLine();
 
-                if (ImGui::SmallButton("Retry"))
+                if (nativeVk)
+                    ImGui::TextUnformatted("Restart the game to retry native Vulkan NR.");
+                else if (ImGui::SmallButton("Retry"))
                     DlssNr::RetryAfterFailure();
+            }
+            else if (feature && feature->Api() == API::DX11 && !feature->IsWithDx12())
+            {
+                ImGui::TextWrapped("NR needs the D3D12 bridge on D3D11. Choose an upscaler marked w/Dx12 and restart.");
+            }
+            else if (nativeVk && config->DlssNrDeferredDlss.value_or_default())
+            {
+                ImGui::TextWrapped("Deferred DLSS residual composition and async NR currently require D3D12 or its bridge."
+                                   " Disable Generate before SR, apply after SR (DLSS) to use native Vulkan NR."
+                                   " Apply before Super Resolution is supported here.");
             }
             else if (enabled)
                 ImGui::TextUnformatted("Waiting for the upscaler to run.");
@@ -285,9 +300,18 @@ void RenderMenu(Config* config, float menuResScale)
 
         ImGui::SeparatorText("Cost");
 
+        bool unlockPasses = config->DlssNrUnlockPasses.value_or_default();
+        if (ImGui::Checkbox("Lift model pass limit (up to 30; expensive)", &unlockPasses))
+            config->DlssNrUnlockPasses = unlockPasses;
+        HelpMarker("Optional extended pass range, inspired by y4my4my4m's fork."
+                   "\nThe normal ceiling remains 3. More passes cost GPU time and VRAM and can amplify artifacts."
+                   "\nHigh counts can exhaust VRAM or trigger a driver timeout. Raise gradually."
+                   "\nNo extra model features are allocated unless those passes are active.");
+        const unsigned int passLimit = unlockPasses ? MaxPassCount : DefaultMaxPassCount;
+
         {
             int passes = (int) std::clamp(config->DlssNrPasses.value_or_default(), 1u,
-                                          DlssNr::MaxPassCount);
+                                          passLimit);
             const ImVec4 colour = passes <= 1   ? ImVec4(0.35f, 0.88f, 0.38f, 1.0f)
                                   : passes == 2 ? ImVec4(0.95f, 0.70f, 0.20f, 1.0f)
                                                 : ImVec4(0.92f, 0.30f, 0.25f, 1.0f);
@@ -295,9 +319,9 @@ void RenderMenu(Config* config, float menuResScale)
             ImGui::PushStyleColor(ImGuiCol_Text, colour);
             ImGui::PushStyleColor(ImGuiCol_SliderGrab, colour);
 
-            if (ImGui::SliderInt("Model passes", &passes, 1, (int) DlssNr::MaxPassCount,
+            if (ImGui::SliderInt("Model passes", &passes, 1, (int) passLimit,
                                  passes == 1 ? "%d (normal)" : "%dx model cost"))
-                config->DlssNrPasses = (uint32_t) std::clamp(passes, 1, (int) DlssNr::MaxPassCount);
+                config->DlssNrPasses = (uint32_t) std::clamp(passes, 1, (int) passLimit);
 
             ImGui::PopStyleColor(2);
 
@@ -305,8 +329,8 @@ void RenderMenu(Config* config, float menuResScale)
                        "\nEach additional layer consumes the previous layer's model output and owns"
                        "\na separate persistent feature and temporal history."
                        "\n\nThe base proxy stays immutable and the final answer is composed against it"
-                       "\nonce, so colour and transfer strength do not compound. Local tone is applied"
-                       "\nonly by the first layer."
+                       "\nonce, so colour and transfer strength do not compound. Later layers default"
+                       "\nto zero local tone; each layer can override it."
                        "\n\nCost scales almost linearly. Two is the common 'deep fried' look; three is"
                        "\nthe guarded ceiling because later layers converge while cost and artifacts grow.");
         }
@@ -529,6 +553,29 @@ void RenderMenu(Config* config, float menuResScale)
             ImGui::SameLine();
             if (ImGui::SmallButton("Reset##mask"))
                 config->DlssNrPass3AutoMask = std::optional<bool> {};
+            ImGui::TreePop();
+        }
+
+        const unsigned int visiblePasses = std::clamp(std::max(config->DlssNrPasses.value_or_default(),
+                                                              config->DlssNrRRPasses.value_or_default()),
+                                                      1u, passLimit);
+        for (unsigned int pass = 3; pass < visiblePasses; ++pass)
+        {
+            auto& settings = config->DlssNrExtraPasses[pass - 3];
+            if (!ImGui::TreeNode(std::format("Pass {}", pass + 1).c_str()))
+                continue;
+            ImGui::TextWrapped("Unset controls inherit pass 1; local tone defaults to 0.");
+            InheritedProfileCombo("Style", &settings.style, inheritedStyles, IM_ARRAYSIZE(inheritedStyles));
+            DeferredSlider("Intensity", &settings.intensity, 0.0f, 2.0f, config->DlssNrIntensity.value_or_default(), "%.2f", true);
+            DeferredSlider("Local structure", &settings.structure, 0.0f, 2.0f, config->DlssNrLocalStructure.value_or_default(), "%.2f", true);
+            DeferredSlider("Local tone", &settings.tone, 0.0f, 2.0f, 0.0f, "%.2f", true);
+            DeferredSlider("Skin structure", &settings.skin, -1.0f, 2.0f, config->DlssNrSkinStructure.value_or_default(), "%.2f", true);
+            bool mask = settings.autoMask.value_or(config->DlssNrAutoMask.value_or_default());
+            if (ImGui::Checkbox("Auto skin mask", &mask))
+                settings.autoMask = mask;
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Reset##mask"))
+                settings.autoMask = std::optional<bool> {};
             ImGui::TreePop();
         }
 
@@ -904,7 +951,7 @@ void RenderMenu(Config* config, float menuResScale)
         // Highlight guard, directly under the white point / trim -- it bounds the model's edit and
         // belongs with the exposure controls it works alongside.
         float maxRatio = config->DlssNrMaxRatio.value_or_default();
-        if (ImGui::SliderFloat("Highlight guard", &maxRatio, 1.0f, 8.0f, "%.1fx"))
+        if (ImGui::SliderFloat("Highlight guard", &maxRatio, 1.0f, unlockPasses ? (float) MaxPassCount : 8.0f, "%.1fx"))
             config->DlssNrMaxRatio = maxRatio;
 
         ImGui::SameLine();
