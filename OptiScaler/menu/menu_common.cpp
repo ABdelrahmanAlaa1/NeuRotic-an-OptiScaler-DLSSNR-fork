@@ -5320,7 +5320,7 @@ void MenuCommon::RenderActiveImageSettings(RenderMenuContext& ctx)
                        (currentBackend == Upscaler::DLSS && currentFeature->Version() >= requiredDlssVersion));
 
         ImGui::Spacing();
-        if (auto ch = ScopedCollapsingHeader("Sharpness"); ch.IsHeaderOpen())
+        if (auto ch = ScopedCollapsingHeader("Sharpness##SharpnessSection"); ch.IsHeaderOpen())
         {
             ScopedIndent indent {};
             ImGui::Spacing();
