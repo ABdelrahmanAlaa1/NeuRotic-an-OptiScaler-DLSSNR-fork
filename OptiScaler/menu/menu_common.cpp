@@ -7701,14 +7701,14 @@ void MenuCommon::RenderMainMenuWindow(RenderMenuContext& ctx)
         // Header/status messages shown above the two-column settings table.
         RenderMainMenuHeaderMessages(ctx);
 
-        // Diagnostics directly below the title/status area and above the settings panels.
+        // Readout and actions directly below the title/status area.
+        RenderMainMenuBottomBar(ctx);
+
+        // Diagnostics below the readout/actions and above the settings panels.
         RenderMainMenuGraphs(ctx);
 
         // Main two-column settings content.
         RenderMainMenuTable(ctx);
-
-        // Footer actions below the settings table.
-        RenderMainMenuBottomBar(ctx);
 
         ImGui::End();
     }
