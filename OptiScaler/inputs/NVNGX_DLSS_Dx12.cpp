@@ -42,16 +42,15 @@ struct RrDlssPipeline
 
 static std::unordered_map<unsigned int, RrDlssPipeline> RrDlssPipelines;
 
-static bool CreateRrBaseOutput(ID3D12Resource* color, ID3D12Resource* fullOutput,
+static bool CreateRrBaseOutput(ID3D12Resource* fullOutput, unsigned int baseWidth, unsigned int baseHeight,
                                Microsoft::WRL::ComPtr<ID3D12Resource>& baseOutput)
 {
-    if (D3D12Device == nullptr || color == nullptr || fullOutput == nullptr)
+    if (D3D12Device == nullptr || fullOutput == nullptr || baseWidth == 0 || baseHeight == 0)
         return false;
 
-    const auto colorDesc = color->GetDesc();
     auto outputDesc = fullOutput->GetDesc();
-    outputDesc.Width = colorDesc.Width;
-    outputDesc.Height = colorDesc.Height;
+    outputDesc.Width = baseWidth;
+    outputDesc.Height = baseHeight;
     outputDesc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 
     const D3D12_HEAP_PROPERTIES heapProperties { D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
@@ -840,12 +839,11 @@ static NVSDK_NGX_Result TryCreateOptiFeature(ID3D12GraphicsCommandList* InCmdLis
         InParameters->Get(NVSDK_NGX_Parameter_OutHeight, &originalOutHeight) == NVSDK_NGX_Result_Success &&
         originalColor != nullptr && originalOutput != nullptr)
     {
-        const auto colorDesc = static_cast<ID3D12Resource*>(originalColor)->GetDesc();
-        pendingRrPipeline.baseWidth = static_cast<unsigned int>(colorDesc.Width);
-        pendingRrPipeline.baseHeight = colorDesc.Height;
+        pendingRrPipeline.baseWidth = originalWidth;
+        pendingRrPipeline.baseHeight = originalHeight;
 
-        if (CreateRrBaseOutput(static_cast<ID3D12Resource*>(originalColor),
-                              static_cast<ID3D12Resource*>(originalOutput), pendingRrPipeline.rrBaseOutput))
+        if (CreateRrBaseOutput(static_cast<ID3D12Resource*>(originalOutput), pendingRrPipeline.baseWidth,
+                               pendingRrPipeline.baseHeight, pendingRrPipeline.rrBaseOutput))
         {
             InParameters->Set(NVSDK_NGX_Parameter_Output, pendingRrPipeline.rrBaseOutput.Get());
             InParameters->Set(NVSDK_NGX_Parameter_Width, pendingRrPipeline.baseWidth);
@@ -853,9 +851,8 @@ static NVSDK_NGX_Result TryCreateOptiFeature(ID3D12GraphicsCommandList* InCmdLis
             InParameters->Set(NVSDK_NGX_Parameter_OutWidth, pendingRrPipeline.baseWidth);
             InParameters->Set(NVSDK_NGX_Parameter_OutHeight, pendingRrPipeline.baseHeight);
             rrPipelinePrepared = true;
-            LOG_INFO("DLSS-NR: creating RR and native SR with base input {}x{} (game reported {}x{}) and output {}x{}",
-                     pendingRrPipeline.baseWidth, pendingRrPipeline.baseHeight,
-                     originalWidth, originalHeight, originalOutWidth, originalOutHeight);
+            LOG_INFO("DLSS-NR: creating RR and native SR with logical base input {}x{} and output {}x{}",
+                     pendingRrPipeline.baseWidth, pendingRrPipeline.baseHeight, originalOutWidth, originalOutHeight);
         }
     }
 
