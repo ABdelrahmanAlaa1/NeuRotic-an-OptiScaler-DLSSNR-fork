@@ -937,9 +937,8 @@ static NVSDK_NGX_Result TryCreateOptiFeature(ID3D12GraphicsCommandList* InCmdLis
         RrDlssPipelines[handleId] = std::move(pendingRrPipeline);
         LOG_INFO("DLSS-NR Test 1.0: dual route ready: Performance ON = RR -> NR -> DLSS SR; "
                  "OFF = RR -> DLSS SR -> NR");
-        const int renderMode = std::clamp(cfg.DlssNrRenderingMode.value_or_default(), 0, 2);
-        LOG_INFO("DLSS-NR rendering mode initialized: {} ({})", renderMode == 0 ? "Quality" :
-                 (renderMode == 1 ? "Performance" : "Private Queue"),
+        const int renderMode = std::clamp(cfg.DlssNrRenderingMode.value_or_default(), 0, 1);
+        LOG_INFO("DLSS-NR rendering mode initialized: {} ({})", renderMode == 0 ? "Quality" : "Performance",
                  renderMode == 0 ? "RR -> DLSS SR -> NR" : "RR -> NR -> DLSS SR");
     }
 
@@ -1467,13 +1466,12 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
     {
         auto& pipeline = rrPipelineIt->second;
         const bool performanceMode = cfg.DlssNrRunBeforeSr.value_or_default();
-        const int renderMode = std::clamp(cfg.DlssNrRenderingMode.value_or_default(), 0, 2);
+        const int renderMode = std::clamp(cfg.DlssNrRenderingMode.value_or_default(), 0, 1);
         static int loggedRenderMode = -1;
         if (loggedRenderMode != renderMode)
         {
             loggedRenderMode = renderMode;
-            LOG_INFO("DLSS-NR rendering mode applied: {} ({})", renderMode == 0 ? "Quality" :
-                     (renderMode == 1 ? "Performance" : "Private Queue"),
+            LOG_INFO("DLSS-NR rendering mode applied: {} ({})", renderMode == 0 ? "Quality" : "Performance",
                      performanceMode ? "RR -> NR -> DLSS SR" : "RR -> DLSS SR -> NR");
         }
 

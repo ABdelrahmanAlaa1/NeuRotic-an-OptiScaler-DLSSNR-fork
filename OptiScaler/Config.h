@@ -258,7 +258,7 @@ class Config
     // an undocumented feature driven directly through its snippet, not something NVIDIA exposes.
     CustomOptional<bool> DlssNrEnabled { false };
     CustomOptional<bool> DlssNrRunBeforeSr { false }; // experimental: run NR before DLSS SR
-    // 0 = Quality (post-SR), 1 = Performance (pre-SR), 2 = Private Queue (pre-SR creation experiment).
+    // 0 = Quality (post-SR), 1 = Performance (pre-SR).
     // Keep the legacy boolean as the routing compatibility surface for existing callers/configurations.
     CustomOptional<int32_t> DlssNrRenderingMode { 1 };
     CustomOptional<bool> DlssNrPreDlaa { false }; // v10: private native-resolution DLAA resolve before NR, then re-jitter before SR

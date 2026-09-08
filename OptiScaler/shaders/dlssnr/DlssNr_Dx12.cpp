@@ -639,7 +639,8 @@ static bool EnsurePrivateCreateKit(ID3D12Device* device)
 static void* CreateNrFeature(const Config& cfg, ID3D12Device* device, ID3D12GraphicsCommandList* gameList,
                              const std::filesystem::path& snippet, unsigned int workWidth, unsigned int workHeight)
 {
-    const bool privateQueue = cfg.DlssNrRenderingMode.value_or_default() == 2;
+    // The former Private Queue experiment is retired; feature creation always stays on the game list.
+    const bool privateQueue = false;
     ID3D12GraphicsCommandList* createList = gameList;
     if (privateQueue)
     {

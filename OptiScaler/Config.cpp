@@ -324,7 +324,8 @@ bool Config::Reload(std::filesystem::path iniPath)
                 performanceMode = readBool("DlssNr", "RunBeforeSR");
             auto renderingMode = readInt("DlssNr", "RenderingMode");
             if (renderingMode.has_value())
-                renderingMode = std::clamp(renderingMode.value(), 0, 2);
+                // Older three-mode profiles map retired mode 2 (Private Queue) to Performance.
+                renderingMode = std::clamp(renderingMode.value(), 0, 1);
             else if (performanceMode.has_value())
                 renderingMode = performanceMode.value() ? 1 : 0;
             // New configurations intentionally default to Performance. Existing profiles retain their
@@ -1216,7 +1217,7 @@ bool Config::SaveIni()
     // --- DLSS 5 Neural Rendering (OptiScaler/dlssnr) ---
     ini.SetValue("DlssNr", "Enabled", GetBoolValue(Instance()->DlssNrEnabled.value_for_config()).c_str());
     // Persist the user-facing key and retain the legacy spelling for prior Alpha builds.
-    const int renderingMode = std::clamp(Instance()->DlssNrRenderingMode.value_or_default(), 0, 2);
+    const int renderingMode = std::clamp(Instance()->DlssNrRenderingMode.value_or_default(), 0, 1);
     ini.SetLongValue("DlssNr", "RenderingMode", static_cast<long>(renderingMode));
     const auto performanceMode = GetBoolValue(renderingMode != 0);
     ini.SetValue("DlssNr", "PerformanceMode", performanceMode.c_str());

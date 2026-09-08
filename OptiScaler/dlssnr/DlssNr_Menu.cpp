@@ -90,8 +90,8 @@ void RenderMenu(Config* config, float menuResScale)
         ScopedIndent indent {};
         ImGui::Spacing();
 
-        static const char* renderModeNames[] = { "Quality", "Performance (Default)", "Private Queue" };
-        int renderMode = std::clamp(config->DlssNrRenderingMode.value_or_default(), 0, 2);
+        static const char* renderModeNames[] = { "Quality", "Performance (Default)" };
+        int renderMode = std::clamp(config->DlssNrRenderingMode.value_or_default(), 0, 1);
         if (ImGui::Combo("Rendering mode", &renderMode, renderModeNames, IM_ARRAYSIZE(renderModeNames)))
         {
             config->DlssNrRenderingMode = renderMode;
@@ -101,8 +101,7 @@ void RenderMenu(Config* config, float menuResScale)
         }
 
         HelpMarker("Quality keeps NR after native DLSS Super Resolution. Performance runs NR before "
-                   "native DLSS Super Resolution. Private Queue keeps the Performance route but uses a "
-                   "private direct queue only when creating or recreating the NR feature; it is not async.");
+                   "native DLSS Super Resolution.");
 
         bool enabled = config->DlssNrEnabled.value_or_default();
         if (ImGui::Checkbox("Enable Neural Rendering", &enabled))
