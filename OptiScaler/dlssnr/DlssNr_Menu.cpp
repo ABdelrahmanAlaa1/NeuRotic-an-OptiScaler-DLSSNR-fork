@@ -89,6 +89,7 @@ void RenderMenu(Config* config, float menuResScale)
     {
         ScopedIndent indent {};
         ImGui::Spacing();
+        ImGui::PushTextWrapPos(0.0f);
 
         static const char* renderModeNames[] = { "Quality", "Performance (Default)" };
         int renderMode = std::clamp(config->DlssNrRenderingMode.value_or_default(), 0, 1);
@@ -374,7 +375,7 @@ void RenderMenu(Config* config, float menuResScale)
         int reversible = (int) config->DlssNrReversibleMode.value_or_default();
         if (reversible < 0 || reversible > 4)
             reversible = 0;
-        if (ImGui::Combo("Reversible proxy (experimental)", &reversible, reversibleNames,
+        if (ImGui::Combo("Reversible proxy", &reversible, reversibleNames,
                          IM_ARRAYSIZE(reversibleNames)))
             config->DlssNrReversibleMode = (uint32_t) reversible;
 
@@ -1105,6 +1106,7 @@ void RenderMenu(Config* config, float menuResScale)
         }
 
         ImGui::PopItemWidth();
+        ImGui::PopTextWrapPos();
     }
 }
 

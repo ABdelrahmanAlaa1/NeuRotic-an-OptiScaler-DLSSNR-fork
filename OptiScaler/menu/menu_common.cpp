@@ -5386,8 +5386,6 @@ void MenuCommon::RenderActiveImageSettings(RenderMenuContext& ctx)
                                "Modified to add Contrast parameter\n"
                                "and MAS support");
 
-                ImGui::SameLine(0.0f, 6.0f);
-
                 if (ImGui::RadioButton("Depth Aware (RCAS)", &sharpnessShader, (int32_t) SharpenShader::DepthAware))
                 {
                     Config::Instance()->SharpnessShader = SharpenShader::DepthAware;
@@ -5398,8 +5396,6 @@ void MenuCommon::RenderActiveImageSettings(RenderMenuContext& ctx)
                                "but also heavier\n\n"
                                "The farther away is the object, the more\n"
                                "sharpening is applied");
-
-                ImGui::SameLine(0.0f, 6.0f);
 
                 if (ImGui::RadioButton("Depth Aware (DAS)", &sharpnessShader,
                                        (int32_t) SharpenShader::LocalContrastDepthAware))
