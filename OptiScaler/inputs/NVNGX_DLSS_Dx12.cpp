@@ -40,11 +40,6 @@ struct RrDlssPipeline
     unsigned int baseWidth = 0;
     unsigned int baseHeight = 0;
     bool fullResolution = false;
-    unsigned int pendingWidth = 0;
-    unsigned int pendingHeight = 0;
-    bool pendingFullResolution = false;
-    unsigned int pendingFrames = 0;
-    std::chrono::steady_clock::time_point lastRebuild {};
     bool resetPending = false;
 };
 
@@ -241,7 +236,6 @@ static bool RebuildRrDlssPipeline(ID3D12GraphicsCommandList* commandList, uint32
         return false;
     }
 
-    replacement.lastRebuild = std::chrono::steady_clock::now();
     replacement.resetPending = true;
     auto retiredPipeline = std::make_unique<RrDlssPipeline>(std::move(pipeline));
     auto retiredRrFeature = std::move(contextIt->second.feature);
@@ -251,7 +245,7 @@ static bool RebuildRrDlssPipeline(ID3D12GraphicsCommandList* commandList, uint32
     Util::DelayedDestroy(std::move(retiredRrFeature));
     Util::DelayedDestroy(std::move(retiredPipeline));
 
-    LOG_INFO("DLSS-NR: RR pipeline switched to {} {}x{} after two matching frames; prior pipeline retires after 2 seconds",
+    LOG_INFO("DLSS-NR: RR pipeline switched immediately to {} {}x{}; prior pipeline retires after 2 seconds",
              pipeline.fullResolution ? "full-resolution DLAA" : "logical", pipeline.baseWidth, pipeline.baseHeight);
     return true;
 }
@@ -1767,38 +1761,20 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
                                        liveDimensions.fullResolution != pipeline.fullResolution;
         if (dimensionsChanged)
         {
-            const auto now = std::chrono::steady_clock::now();
-            const bool cooldownElapsed = pipeline.lastRebuild.time_since_epoch().count() == 0 ||
-                                         now - pipeline.lastRebuild >= std::chrono::seconds(2);
-            if (cooldownElapsed)
+            // The current frame's Color, Depth and MotionVectors unanimously identify the active render extent.
+            // Rebuild before evaluating this frame: waiting would run the changed resources through a stale-sized
+            // RR/DLSS pair and reproduce the crop or black-frame failure this transition handling exists to prevent.
+            if (!RebuildRrDlssPipeline(InCmdList, handleId, InParameters, pipeline, liveDimensions, originalColor,
+                                       originalOutput, originalWidth, originalHeight, originalOutWidth,
+                                       originalOutHeight, originalSubrectWidth, originalSubrectHeight,
+                                       hasOriginalSubrectDimensions, originalQuality, hasOriginalQuality))
             {
-                const bool samePendingDimensions = pipeline.pendingWidth == liveDimensions.width &&
-                                                   pipeline.pendingHeight == liveDimensions.height &&
-                                                   pipeline.pendingFullResolution == liveDimensions.fullResolution;
-                pipeline.pendingFrames = samePendingDimensions ? pipeline.pendingFrames + 1 : 1;
-                pipeline.pendingWidth = liveDimensions.width;
-                pipeline.pendingHeight = liveDimensions.height;
-                pipeline.pendingFullResolution = liveDimensions.fullResolution;
-
-                if (pipeline.pendingFrames == 2)
-                {
-                    if (!RebuildRrDlssPipeline(InCmdList, handleId, InParameters, pipeline, liveDimensions,
-                                               originalColor, originalOutput, originalWidth, originalHeight,
-                                               originalOutWidth, originalOutHeight, originalSubrectWidth,
-                                               originalSubrectHeight, hasOriginalSubrectDimensions, originalQuality,
-                                               hasOriginalQuality))
-                    {
-                        LOG_ERROR("DLSS-NR: keeping the existing RR pipeline after {}x{} transition rebuild failed",
-                                  liveDimensions.width, liveDimensions.height);
-                        pipeline.lastRebuild = std::chrono::steady_clock::now();
-                    }
-                    pipeline.pendingFrames = 0;
-                }
+                LOG_ERROR("DLSS-NR: refusing to evaluate {}x{} resources through the stale {}x{} RR pipeline after "
+                          "the immediate transition rebuild failed",
+                          liveDimensions.width, liveDimensions.height, pipeline.baseWidth, pipeline.baseHeight);
+                DlssNr::RestoreAfterUpscale(InParameters);
+                return NVSDK_NGX_Result_Fail;
             }
-        }
-        else
-        {
-            pipeline.pendingFrames = 0;
         }
 
         const bool forceReset = pipeline.resetPending;
