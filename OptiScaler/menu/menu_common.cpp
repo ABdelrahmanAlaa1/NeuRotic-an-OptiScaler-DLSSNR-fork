@@ -66,7 +66,6 @@ static std::string selectedUpscalerName = "";
 static Upscaler currentBackend = Upscaler::Reset;
 static std::string currentBackendName = "";
 static int refreshRate = 0;
-static ImVec2 lastPosition(-1000.0f, -1000.0f);
 
 static ImVec2 splashPosition(-1000.0f, -1000.0f);
 static ImVec2 splashSize(0.0f, 0.0f);
@@ -7318,9 +7317,6 @@ void MenuCommon::RenderMainMenuBottomBar(RenderMenuContext& ctx)
         io.WantCaptureMouse = false;
     }
 
-    auto winSize = ImGui::GetWindowSize();
-    auto winPos = ImGui::GetWindowPos();
-
     ImGui::SameLine();
 
     auto textSize = ImGui::CalcTextSize("Open Wiki (?)");
@@ -7353,26 +7349,6 @@ void MenuCommon::RenderMainMenuBottomBar(RenderMenuContext& ctx)
         ImGui::Spacing();
     }
 
-    if (lastPosition.x < -900.0f || (lastPosition.x >= winPos.x - 1.0f && lastPosition.y >= winPos.y - 1.0f &&
-                                     lastPosition.x <= winPos.x + 1.0f && lastPosition.y <= winPos.y + 1.0f))
-    {
-        float posX;
-        float posY;
-
-        posX = ((float) io.DisplaySize.x - winSize.x) / 2.0f;
-        posY = ((float) io.DisplaySize.y - winSize.y) / 2.0f;
-
-        // don't position menu outside of screen
-        if (posX < 0.0 || posY < 0.0)
-        {
-            posX = 50;
-            posY = 50;
-        }
-
-        ImGui::SetWindowPos(ImVec2 { posX, posY });
-        lastPosition.x = posX;
-        lastPosition.y = posY;
-    }
 }
 
 void MenuCommon::RenderMipmapBiasWindow(RenderMenuContext& ctx, ImGuiWindowFlags flags)
@@ -7690,6 +7666,13 @@ void MenuCommon::RenderMainMenuWindow(RenderMenuContext& ctx)
                              (state.detectedQuirks.size() > 0) ? "(Q)" : "", state.isOptiPatcherSucceed ? "(OP)" : "");
     }
 
+    // Start flush with the main viewport's upper-right corner. ImGuiCond_Once leaves later
+    // user-dragged positions alone, and avoiding per-frame recentering lets auto-resize add
+    // vertical content below the title bar instead of moving the entire window upward.
+    const ImGuiViewport* mainViewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos({ mainViewport->Pos.x + mainViewport->Size.x, mainViewport->Pos.y }, ImGuiCond_Once,
+                            { 1.0f, 0.0f });
+
     // Pin only the horizontal axis to a scale-aware width. The vertical axis remains auto-sized,
     // while the two stretch tables retain enough room for their controls without feeding the
     // previous frame's width back into AlwaysAutoResize.
@@ -7870,7 +7853,6 @@ void MenuCommon::Init(HWND InHwnd, bool isUWP)
     _handle = InHwnd;
     _isVisible = false;
     _isUWP = isUWP;
-    lastPosition = { -1000.0f, -1000.0f };
 
     LOG_DEBUG("Handle: {0:X}", (size_t) _handle);
 
