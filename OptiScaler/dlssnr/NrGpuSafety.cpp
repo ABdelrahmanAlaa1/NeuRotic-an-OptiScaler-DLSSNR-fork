@@ -108,13 +108,20 @@ template<class T> bool Put(ID3D12Object* object, REFGUID key, const std::shared_
     cookie->Release();
     return SUCCEEDED(hr);
 }
-ID3D12GraphicsCommandList* NativeList(ID3D12GraphicsCommandList* list)
+template<class T> T* NativeObject(T* object)
 {
 #ifndef NR_GPU_SAFETY_TEST
-    ID3D12GraphicsCommandList* real = nullptr;
-    if (CheckForRealObject(__FUNCTION__, list, (IUnknown**)&real)) return real;
+    // Same Streamline native-object interface as Util::CheckForRealObject, without its mutable
+    // lazy GUID initialization or per-call log (this runs for every NR dispatch).
+    constexpr GUID nativeGuid = {0xadec44e2, 0x61f0, 0x45c3, {0xad,0x9f,0x1b,0x37,0x37,0x92,0x84,0xff}};
+    T* real = nullptr;
+    if (SUCCEEDED(object->QueryInterface(nativeGuid, reinterpret_cast<void**>(&real))) && real)
+    {
+        real->Release(); // the caller's live wrapper owns the borrowed native object
+        return real;
+    }
 #endif
-    return list;
+    return object;
 }
 
 bool Completed(const Ticket& t)
@@ -193,11 +200,7 @@ bool EnsureHooks(ID3D12GraphicsCommandList* list)
     desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     if (FAILED(list->GetDevice(IID_PPV_ARGS(&device))) ||
         FAILED(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue)))) return false;
-    ID3D12CommandQueue* nativeQueue = queue.Get();
-#ifndef NR_GPU_SAFETY_TEST
-    ID3D12CommandQueue* real = nullptr;
-    if (CheckForRealObject(__FUNCTION__, nativeQueue, (IUnknown**)&real)) nativeQueue = real;
-#endif
+    ID3D12CommandQueue* nativeQueue = NativeObject(queue.Get());
     originalExecute = reinterpret_cast<ExecuteFn>((*(void***)nativeQueue)[10]);
     originalReset = reinterpret_cast<ResetFn>(target);
     resetTarget = target;
@@ -220,7 +223,7 @@ Ticket Record(ID3D12GraphicsCommandList* list)
 {
     if (!list || (list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT &&
                   list->GetType() != D3D12_COMMAND_LIST_TYPE_COMPUTE)) return {};
-    list = NativeList(list);
+    list = NativeObject(list);
     if (!EnsureHooks(list)) return Unavailable("command-list completion hooks unavailable");
     auto& s = State();
     std::lock_guard lock(s.mutex);
