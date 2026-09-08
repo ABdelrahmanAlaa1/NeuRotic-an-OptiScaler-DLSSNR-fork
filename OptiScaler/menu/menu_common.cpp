@@ -7684,8 +7684,6 @@ void MenuCommon::RenderMainMenuWindow(RenderMenuContext& ctx)
         style.ScaleAllSizes(menuResScale);
         style.MouseCursorScale = 1.0f;
         CopyMemory(style.Colors, styleold.Colors, sizeof(style.Colors)); // Restore colors
-
-        ImGui::SetNextWindowSize({ 1.0f, 1.0f });
     }
 
     // Main menu window
@@ -7695,6 +7693,11 @@ void MenuCommon::RenderMainMenuWindow(RenderMenuContext& ctx)
                              state.gameName.empty() ? "" : StrFmt("- %s", state.gameName.c_str()).c_str(),
                              (state.detectedQuirks.size() > 0) ? "(Q)" : "", state.isOptiPatcherSucceed ? "(OP)" : "");
     }
+
+    // Pin only the horizontal axis to a scale-aware width. The vertical axis remains auto-sized,
+    // while the two stretch tables retain enough room for their controls without feeding the
+    // previous frame's width back into AlwaysAutoResize.
+    ImGui::SetNextWindowSize({ std::round(900.0f * menuResScale), 0.0f });
 
     if (ImGui::Begin(windowTitle.c_str(), NULL, flags))
     {
