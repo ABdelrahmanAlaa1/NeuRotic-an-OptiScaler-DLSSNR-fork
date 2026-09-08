@@ -389,7 +389,9 @@ class Keybind
         return "Unknown";
     }
 
-    void Render(CustomOptional<int>& configKey)
+    template<class Option>
+        requires (std::same_as<Option, CustomOptional<int>> || std::same_as<Option, NrOptional<int>>)
+    void Render(Option& configKey)
     {
         ImGui::PushID(id);
         if (ImGui::Button(name.c_str()))
