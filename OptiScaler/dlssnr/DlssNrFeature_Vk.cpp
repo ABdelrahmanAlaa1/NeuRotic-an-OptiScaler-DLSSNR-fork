@@ -19,6 +19,7 @@
 
 namespace DlssNr
 {
+static void ShutdownVkLocked(bool deviceAlive);
 
 namespace
 {
@@ -61,6 +62,7 @@ struct VkState
     PFN_VkCreate create = nullptr;
     PFN_VkEvaluate evaluate = nullptr;
     PFN_VkRelease release = nullptr;
+    int (*shutdown)(int) = nullptr;
 
     VkInstance instance = VK_NULL_HANDLE;
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
@@ -142,6 +144,8 @@ constexpr uint32_t kTimingSlots = 4;
 
 VkState g_vk;
 std::mutex g_vkMutex;
+bool g_vkSessionClosed = false;
+bool g_vkShutdownFailed = false;
 
 void Fail(const char* why)
 {
@@ -400,7 +404,8 @@ void TransitionForeign(VkCommandBuffer cmd, VkImage image, VkImageSubresourceRan
 bool LoadForwarder()
 {
     if (g_vk.forwarder != nullptr)
-        return g_vk.create != nullptr;
+        return g_vk.init != nullptr && g_vk.create != nullptr && g_vk.evaluate != nullptr &&
+               g_vk.release != nullptr && g_vk.shutdown != nullptr;
 
     auto path = Util::FindFilePath(Util::DllPath().remove_filename(), "nvngx.dll_dlssnr.dll");
 
@@ -426,8 +431,10 @@ bool LoadForwarder()
     g_vk.create = (PFN_VkCreate) GetProcAddress(g_vk.forwarder, "dlssnr_vk_create");
     g_vk.evaluate = (PFN_VkEvaluate) GetProcAddress(g_vk.forwarder, "dlssnr_vk_evaluate");
     g_vk.release = (PFN_VkRelease) GetProcAddress(g_vk.forwarder, "dlssnr_vk_release");
+    g_vk.shutdown = (int (*)(int)) GetProcAddress(g_vk.forwarder, "dlssnr_vk_shutdown");
 
-    if (g_vk.init == nullptr || g_vk.create == nullptr || g_vk.evaluate == nullptr)
+    if (g_vk.init == nullptr || g_vk.create == nullptr || g_vk.evaluate == nullptr ||
+        g_vk.release == nullptr || g_vk.shutdown == nullptr)
     {
         Fail("the forwarder is missing its Vulkan entry points");
         return false;
@@ -505,6 +512,20 @@ void EvaluateAfterUpscaleVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* para
         return;
 
     std::lock_guard<std::mutex> lock(g_vkMutex);
+
+    if (g_vkSessionClosed || g_vkShutdownFailed)
+        return;
+
+    // Invalidate the old generation BEFORE reading mapped exposure memory or other old handles.
+    // Vulkan has no retained COM device identity; preserve the existing dead-device abandonment
+    // policy when shutdown was not observed, without calling the old driver.
+    if (g_vk.device != device)
+    {
+        ShutdownVkLocked(false);
+        g_vk.device = device;
+    }
+    g_vk.instance = instance;
+    g_vk.physicalDevice = physicalDevice;
 
     if (g_vk.failed)
         return;
@@ -616,20 +637,6 @@ void EvaluateAfterUpscaleVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* para
     const uint32_t workWidth = (uint32_t) (width * workScale + 0.5f);
     const uint32_t workHeight = (uint32_t) (height * workScale + 0.5f);
     const bool reduced = workWidth != width || workHeight != height;
-
-    g_vk.instance = instance;
-    g_vk.physicalDevice = physicalDevice;
-
-    // A device change invalidates everything. The OLD device is presumed dead here -- the game
-    // destroyed it, which already freed every resource made on it -- so abandon those handles rather
-    // than call vkDestroy*/wait-idle on a dead device (that would be use-after-free). Rebuild fresh.
-    if (g_vk.device != device)
-    {
-        ShutdownVk(false);
-        g_vk.device = device;
-        g_vk.instance = instance;
-        g_vk.physicalDevice = physicalDevice;
-    }
 
     if (!LoadForwarder())
         return;
@@ -1139,7 +1146,7 @@ void EvaluateAfterUpscaleVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* para
     }
 }
 
-void ShutdownVk(bool deviceAlive)
+static void ShutdownVkLocked(bool deviceAlive)
 {
     if (!deviceAlive)
     {
@@ -1156,7 +1163,11 @@ void ShutdownVk(bool deviceAlive)
         g_vk.superDown.release();
         g_vk.nrScaler = Scaler::Count;
         g_vk.feature = nullptr;
+        // The wrapper can allocate through the driver core. Its old generation may already be
+        // gone too, so do not call DestroyParameters on this abandonment path.
         g_vk.capabilityParams = nullptr;
+        if (g_vk.shutdown != nullptr)
+            g_vk.shutdown(0);
         g_vk.queryPool = VK_NULL_HANDLE;
         g_vk.output = OwnedImage {};
         g_vk.proxy = OwnedImage {};
@@ -1182,6 +1193,8 @@ void ShutdownVk(bool deviceAlive)
         g_vk.lastGpuTime.reset();
         g_vk.ngxInitialised = false;
         g_vk.reset = true;
+        g_vk.failed = false;
+        g_vk.reason = "";
         return;
     }
 
@@ -1194,6 +1207,17 @@ void ShutdownVk(bool deviceAlive)
         g_vk.release(g_vk.feature);
 
     g_vk.feature = nullptr;
+
+    if (g_vk.shutdown != nullptr)
+    {
+        const int result = g_vk.shutdown(1);
+        if (result != 1)
+        {
+            g_vkShutdownFailed = true;
+            LOG_ERROR("DLSS-NR Vulkan: model shutdown returned 0x{:X}; further NR initialization blocked",
+                      (unsigned int) result);
+        }
+    }
 
     DestroyImage(g_vk.output);
     DestroyImage(g_vk.proxy);
@@ -1224,10 +1248,32 @@ void ShutdownVk(bool deviceAlive)
     g_vk.lastGpuTime.reset();
 
     g_vk.device = VK_NULL_HANDLE;
+    g_vk.instance = VK_NULL_HANDLE;
+    g_vk.physicalDevice = VK_NULL_HANDLE;
     g_vk.width = 0;
     g_vk.height = 0;
+    g_vk.workWidth = g_vk.workHeight = 0;
     g_vk.ngxInitialised = false;
     g_vk.reset = true;
+    g_vk.failed = false;
+    g_vk.reason = "";
+    g_vk.frames = 0;
+}
+
+void ShutdownVk(bool deviceAlive)
+{
+    std::lock_guard<std::mutex> lock(g_vkMutex);
+    if (g_vkSessionClosed)
+        return;
+    g_vkSessionClosed = true;
+    ShutdownVkLocked(deviceAlive);
+}
+
+void NotifyDeviceInitVk()
+{
+    std::lock_guard<std::mutex> lock(g_vkMutex);
+    if (!g_vkShutdownFailed)
+        g_vkSessionClosed = false;
 }
 
 } // namespace DlssNr

@@ -58,6 +58,7 @@ using PFN_NrInitExt = int(__cdecl *)(unsigned long long, const wchar_t *, ID3D12
 using PFN_NrCreate = int(__cdecl *)(ID3D12GraphicsCommandList *, int, const void *, void **);
 using PFN_NrEvaluate = int(__cdecl *)(ID3D12GraphicsCommandList *, const void *, const void *, void *);
 using PFN_NrRelease = int(__cdecl *)(void *);
+using PFN_NrShutdown = int(__cdecl *)();
 
 struct Snippet {
     HMODULE module = nullptr;
@@ -65,7 +66,9 @@ struct Snippet {
     PFN_NrCreate create = nullptr;
     PFN_NrEvaluate evaluate = nullptr;
     PFN_NrRelease release = nullptr;
+    PFN_NrShutdown shutdown = nullptr;
     bool initialised = false;
+    ID3D12Device *device = nullptr;
 
 };
 
@@ -83,6 +86,7 @@ bool loadSnippet(const wchar_t *path) {
     g_snip.create = (PFN_NrCreate) GetProcAddress(g_snip.module, "NVSDK_NGX_D3D12_CreateFeature");
     g_snip.evaluate = (PFN_NrEvaluate) GetProcAddress(g_snip.module, "NVSDK_NGX_D3D12_EvaluateFeature");
     g_snip.release = (PFN_NrRelease) GetProcAddress(g_snip.module, "NVSDK_NGX_D3D12_ReleaseFeature");
+    g_snip.shutdown = (PFN_NrShutdown) GetProcAddress(g_snip.module, "NVSDK_NGX_D3D12_Shutdown");
 
 
     return g_snip.create != nullptr && g_snip.evaluate != nullptr;
@@ -114,6 +118,23 @@ __declspec(dllexport) void dlssnr_call_probe_float(void *params, const char *nam
 __declspec(dllexport) int dlssnr_call_last_init = 0;
 __declspec(dllexport) int dlssnr_call_last_create = 0;
 
+// The host releases every feature before ending this generation. Keep the module loaded: callbacks
+// and other API surfaces may still refer to its code. Never tail-call past the caller gate.
+__declspec(dllexport) int dlssnr_call_shutdown() {
+    volatile int result = 1;
+    if (g_snip.initialised) {
+        if (!g_snip.shutdown) return -1;
+        result = g_snip.shutdown();
+        if (result != 1) return (int) result;
+    }
+    g_snip.initialised = false;
+    g_snip.device = nullptr;
+    g_floatSlot = 1;
+    dlssnr_call_last_init = 0;
+    dlssnr_call_last_create = 0;
+    return (int) result;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Vulkan.
 //
@@ -143,7 +164,9 @@ struct VkSnippet {
     PFN_NrVkCreate create = nullptr;
     PFN_NrVkEvaluate evaluate = nullptr;
     PFN_NrRelease release = nullptr;
+    PFN_NrShutdown shutdown = nullptr;
     bool initialised = false;
+    void *device = nullptr;
 };
 
 VkSnippet g_vk;
@@ -163,6 +186,7 @@ bool loadVkSnippet(const wchar_t *path) {
     g_vk.create = (PFN_NrVkCreate) GetProcAddress(g_vk.module, "NVSDK_NGX_VULKAN_CreateFeature");
     g_vk.evaluate = (PFN_NrVkEvaluate) GetProcAddress(g_vk.module, "NVSDK_NGX_VULKAN_EvaluateFeature");
     g_vk.release = (PFN_NrRelease) GetProcAddress(g_vk.module, "NVSDK_NGX_VULKAN_ReleaseFeature");
+    g_vk.shutdown = (PFN_NrShutdown) GetProcAddress(g_vk.module, "NVSDK_NGX_VULKAN_Shutdown");
 
     return g_vk.create != nullptr && g_vk.evaluate != nullptr;
 }
@@ -596,12 +620,12 @@ __declspec(dllexport) int dlssnr_vk_probe(const wchar_t *snippetPath) {
 __declspec(dllexport) int dlssnr_vk_init(const wchar_t *snippetPath, const wchar_t *dataPath,
                                          void *instance, void *physicalDevice, void *device,
                                          int sdkVersion) {
-    if (!loadVkSnippet(snippetPath) || g_vk.init == nullptr) {
+    if (!loadVkSnippet(snippetPath) || g_vk.init == nullptr || g_vk.shutdown == nullptr) {
         return -1;
     }
 
     if (g_vk.initialised) {
-        return 1;
+        return g_vk.device == device ? 1 : -1;
     }
 
     // Assigned rather than returned directly. A tail call becomes a jmp, and the snippet resolves its
@@ -611,7 +635,22 @@ __declspec(dllexport) int dlssnr_vk_init(const wchar_t *snippetPath, const wchar
 
     dlssnr_vk_last_init = (int) result;
     g_vk.initialised = result == 1;
+    if (g_vk.initialised) g_vk.device = device;
 
+    return (int) result;
+}
+
+// deviceAlive=false is the existing lost-device abandonment path: do not enter the dead driver.
+__declspec(dllexport) int dlssnr_vk_shutdown(int deviceAlive) {
+    volatile int result = 1;
+    if (deviceAlive && g_vk.initialised) {
+        if (!g_vk.shutdown) return -1;
+        result = g_vk.shutdown();
+        if (result != 1) return (int) result;
+    }
+    g_vk.initialised = false;
+    g_vk.device = nullptr;
+    dlssnr_vk_last_init = 0;
     return (int) result;
 }
 
@@ -740,9 +779,11 @@ __declspec(dllexport) void *dlssnr_call_create(const wchar_t *snippetPath, const
                                                int style, float localStructure, float localTone,
                                                float skinStructure, int useAutoMask,
                                                int uiCorrection) {
-    if (!loadSnippet(snippetPath) || !capabilityParams) {
+    if (!loadSnippet(snippetPath) || !capabilityParams || !device || !g_snip.init ||
+        !g_snip.shutdown || !g_snip.release || !g_snip.evaluate) {
         return nullptr;
     }
+    if (g_snip.initialised && g_snip.device != device) return nullptr;
     if (!g_snip.initialised && g_snip.init) {
         // OptiScaler's own generic application id, the one it already hands DLSS when a game's id is
         // not wanted. What was here before was 0x4350324B -- "CP2K" -- so every game that ever loaded
@@ -752,6 +793,7 @@ __declspec(dllexport) void *dlssnr_call_create(const wchar_t *snippetPath, const
         if (!g_snip.initialised) {
             return nullptr;
         }
+        g_snip.device = device;
     }
     setUInt(capabilityParams, "DLSSNR.Enabled", 1);
     setUInt(capabilityParams, "DLSSNR.Width", width);

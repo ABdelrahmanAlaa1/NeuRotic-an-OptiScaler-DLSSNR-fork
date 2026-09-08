@@ -250,6 +250,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_VULKAN_Init_Ext2(
     UpscalerTimeVk::Init(InDevice, InPD);
 
     State::Instance().nvngxVkInited = true;
+    DlssNr::NotifyDeviceInitVk();
 
     return NVSDK_NGX_Result_Success;
 }
@@ -1114,6 +1115,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_VULKAN_EvaluateFeature(VkCommandBuffer 
 NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_VULKAN_Shutdown(void)
 {
     shutdown = true;
+    DlssNr::ShutdownVk();
 
     // for (auto const& [key, val] : VkContexts) {
     //     if (val.feature)
@@ -1150,6 +1152,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_VULKAN_Shutdown(void)
 NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_VULKAN_Shutdown1(VkDevice InDevice)
 {
     shutdown = true;
+    DlssNr::ShutdownVk();
 
     if (Config::Instance()->DLSSEnabled.value_or_default() && NVNGXProxy::IsVulkanInited() &&
         NVNGXProxy::VULKAN_Shutdown1() != nullptr)

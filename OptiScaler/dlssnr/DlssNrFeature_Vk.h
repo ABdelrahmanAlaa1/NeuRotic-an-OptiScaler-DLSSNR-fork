@@ -63,5 +63,6 @@ std::optional<double> LastGpuTimeVk();
 bool ExposureOfferedVk();
 
 void ShutdownVk(bool deviceAlive = true);
+void NotifyDeviceInitVk();
 
 } // namespace DlssNr

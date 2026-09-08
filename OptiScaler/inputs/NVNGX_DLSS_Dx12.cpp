@@ -568,6 +568,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_Init_Ext(unsigned long long InApp
     State::Instance().nvngxDx12Inited = true;
 
     UpscalerInputsDx12::Init(InDevice);
+    DlssNr::NotifyDeviceInit(InDevice);
 
     return NVSDK_NGX_Result_Success;
 }
@@ -722,7 +723,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_Shutdown(void)
 {
     shutdown = true;
 
-    // NR owns a driver feature, borrowed capability parameters, and device-bound scratch resources.
+    // NR owns driver features, capability parameters, and device-bound scratch resources.
     // Release them while the native NGX core is still live so a later initialization cannot reuse a
     // stale generation.
     DlssNr::Shutdown();
@@ -775,6 +776,8 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_Shutdown(void)
 NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_Shutdown1(ID3D12Device* InDevice)
 {
     shutdown = true;
+    // Shutdown1 must release NR before either native NGX shutdown variant is invoked.
+    DlssNr::Shutdown();
     State::Instance().nvngxDx12Inited = false;
 
     if (State::Instance().activeFgNvngx != FGNvngxReplacement::None)

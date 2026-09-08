@@ -212,6 +212,7 @@ struct NrState
     PFN_NrCreate create = nullptr;
     PFN_NrEvaluate evaluate = nullptr;
     PFN_NrRelease release = nullptr;
+    int (*shutdown)() = nullptr;
     PFN_NrSetExtras setExtras = nullptr;
     PFN_NrSetFloatSlot setFloatSlot = nullptr;
     PFN_NrProbeFloat probeFloat = nullptr;
@@ -432,6 +433,34 @@ struct NrState
 NrState g_nr;
 std::unique_ptr<DlssNr_Dx12> g_compose;
 
+// Pre-SR calls After-SR internally; serialize the complete host transaction against teardown.
+// Lock order is lifecycle -> g_nrMutex. The latter continues to guard Dispatch's model state.
+std::recursive_mutex g_lifecycleMutex;
+ID3D12Device* g_generationDevice = nullptr; // retained until explicit NGX shutdown
+bool g_sessionClosed = false;
+bool g_shutdownFailed = false;
+
+bool AcceptGenerationDevice(ID3D12Device* device)
+{
+    if (g_sessionClosed || g_shutdownFailed || device == nullptr)
+        return false;
+    if (g_generationDevice == nullptr)
+    {
+        device->AddRef();
+        g_generationDevice = device;
+    }
+    if (g_generationDevice == device)
+        return true;
+
+    // A different device does not prove completion on the old queue. Keep the old generation
+    // intact and bypass NR until the host supplies the explicit shutdown/init boundary.
+    if (!g_nr.failed)
+        LOG_ERROR("DLSS-NR: device changed without NGX shutdown; bypassing NR until session restart");
+    g_nr.failed = true;
+    g_nr.reason = "device changed without NGX shutdown; restart the session";
+    return false;
+}
+
 // What the pass costs on the GPU, for the breakdown in the overlay.
 std::unique_ptr<GpuTime_Dx12> g_gpuTime;
 
@@ -596,7 +625,8 @@ std::filesystem::path g_dllDir;
 bool EnsureForwarder()
 {
     if (g_nr.forwarder != nullptr)
-        return g_nr.create != nullptr;
+        return g_nr.create != nullptr && g_nr.evaluate != nullptr && g_nr.release != nullptr &&
+               g_nr.shutdown != nullptr;
 
     if (g_dllDir.empty())
         g_dllDir = Util::DllPath().remove_filename();
@@ -635,6 +665,7 @@ bool EnsureForwarder()
     g_nr.create = (PFN_NrCreate) GetProcAddress(g_nr.forwarder, "dlssnr_call_create");
     g_nr.evaluate = (PFN_NrEvaluate) GetProcAddress(g_nr.forwarder, "dlssnr_call_evaluate");
     g_nr.release = (PFN_NrRelease) GetProcAddress(g_nr.forwarder, "dlssnr_call_release");
+    g_nr.shutdown = (int (*)()) GetProcAddress(g_nr.forwarder, "dlssnr_call_shutdown");
     // Optional: an older forwarder simply lacks it, and the model runs as before.
     g_nr.setExtras = (PFN_NrSetExtras) GetProcAddress(g_nr.forwarder, "dlssnr_call_set_extras");
     g_nr.setFloatSlot = (PFN_NrSetFloatSlot) GetProcAddress(g_nr.forwarder, "dlssnr_call_set_float_slot");
@@ -642,7 +673,8 @@ bool EnsureForwarder()
     g_nr.lastInit = (int*) GetProcAddress(g_nr.forwarder, "dlssnr_call_last_init");
     g_nr.lastCreate = (int*) GetProcAddress(g_nr.forwarder, "dlssnr_call_last_create");
 
-    if (g_nr.create == nullptr || g_nr.evaluate == nullptr)
+    if (g_nr.create == nullptr || g_nr.evaluate == nullptr || g_nr.release == nullptr ||
+        g_nr.shutdown == nullptr)
     {
         g_nr.reason = "the forwarder is missing its exports";
         return false;
@@ -668,7 +700,8 @@ bool EnsureCapabilityParams(ID3D12Device* device)
         return false;
     }
 
-    if (NVNGXProxy::D3D12_GetCapabilityParameters() == nullptr)
+    if (NVNGXProxy::D3D12_GetCapabilityParameters() == nullptr ||
+        NVNGXProxy::D3D12_DestroyParameters() == nullptr)
     {
         g_nr.reason = "the NGX core has no capability parameters";
         return false;
@@ -3101,6 +3134,7 @@ ID3D12Resource* EvaluatePreDlaa(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Pa
 
 void RestoreAfterUpscale(NVSDK_NGX_Parameter* params)
 {
+    std::lock_guard<std::recursive_mutex> lifecycleLock(g_lifecycleMutex);
     if (params == nullptr || !g_nr.preDlaaFinalOverrideActive)
         return;
 
@@ -3112,6 +3146,9 @@ void RestoreAfterUpscale(NVSDK_NGX_Parameter* params)
 ID3D12Resource* EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,
                                       ID3D12CommandQueue* timingQueue)
 {
+    std::lock_guard<std::recursive_mutex> lifecycleLock(g_lifecycleMutex);
+    if (g_sessionClosed || g_shutdownFailed)
+        return nullptr;
     const Config& cfg = *Config::Instance();
 
     if (!cfg.DlssNrEnabled.value_or_default() || !cfg.DlssNrRunBeforeSr.value_or_default() ||
@@ -3139,6 +3176,12 @@ ID3D12Resource* EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_
     ID3D12Device* device = nullptr;
     if (FAILED(color->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr)
         return nullptr;
+
+    if (!AcceptGenerationDevice(device))
+    {
+        device->Release();
+        return nullptr;
+    }
 
     const uint32_t observedWidth = (uint32_t) colorDesc.Width;
     const uint32_t observedHeight = colorDesc.Height;
@@ -3581,6 +3624,9 @@ ID3D12Resource* EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_
 void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,
                           ID3D12CommandQueue* timingQueue, bool forceAfterUpscale)
 {
+    std::lock_guard<std::recursive_mutex> lifecycleLock(g_lifecycleMutex);
+    if (g_sessionClosed || g_shutdownFailed)
+        return;
     if (!Config::Instance()->DlssNrEnabled.value_or_default())
     {
         ReportSkipOnce("it is switched off");
@@ -3819,6 +3865,12 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
         return;
     }
 
+    if (!AcceptGenerationDevice(device))
+    {
+        device->Release();
+        return;
+    }
+
     // The pass is the object, so the caller holds it. Built once, on the device the frame is on.
     if (g_compose == nullptr)
         g_compose = std::make_unique<DlssNr_Dx12>("Neural Rendering", device);
@@ -4048,9 +4100,36 @@ bool CaptureInProgress() { return g_capture.isActive(); }
 
 void Shutdown()
 {
+    std::lock_guard<std::recursive_mutex> lifecycleLock(g_lifecycleMutex);
     std::lock_guard<std::mutex> nrLock(g_nrMutex);
+    if (g_sessionClosed)
+        return;
+    g_sessionClosed = true;
 
     ReleasePrivateCreateKit();
+    Proxy::Shutdown();
+    ExposureScan::Shutdown();
+
+    // Private DLAA is a native NGX feature, not a forwarder feature. Drain both its live and
+    // retired ownership here while the core still exports ReleaseFeature.
+    const auto releaseDlaa = NVNGXProxy::D3D12_ReleaseFeature();
+    if (g_nr.preDlaaFeature != nullptr && releaseDlaa != nullptr)
+        releaseDlaa(g_nr.preDlaaFeature);
+    if (g_nr.preDlaaOutput != nullptr)
+        g_nr.preDlaaOutput->Release();
+    for (auto& r : g_preDlaaRetired)
+    {
+        if (r.feature != nullptr && releaseDlaa != nullptr) releaseDlaa(r.feature);
+        if (r.output != nullptr) r.output->Release();
+    }
+    g_preDlaaRetired.clear();
+    g_nr.preDlaaFeature = nullptr;
+    g_nr.preDlaaOutput = nullptr;
+    g_nr.preDlaaWidth = g_nr.preDlaaHeight = 0;
+    g_nr.preDlaaFormat = DXGI_FORMAT_UNKNOWN;
+    g_nr.preDlaaNeedsReset = true;
+    g_nr.preDlaaFinalResetPending = false;
+    g_nr.preDlaaFinalOverrideActive = false;
 
     for (auto& r : g_nrRetired)
     {
@@ -4228,5 +4307,37 @@ void Shutdown()
     g_lastGpuTime.reset();
 
     g_compose.reset();
+
+    if (g_nr.shutdown != nullptr)
+    {
+        const int result = g_nr.shutdown();
+        if (result != 1)
+        {
+            g_shutdownFailed = true;
+            LOG_ERROR("DLSS-NR: model shutdown returned 0x{:X}; further NR initialization blocked",
+                      (unsigned int) result);
+        }
+    }
+    if (g_nr.capabilityParams != nullptr && NVNGXProxy::D3D12_DestroyParameters() != nullptr)
+        NVNGXProxy::D3D12_DestroyParameters()(g_nr.capabilityParams);
+    g_nr.capabilityParams = nullptr;
+    g_nr.floatSlotKnown = false;
+    g_nr.failed = false;
+    g_nr.reason = "";
+    g_nr.reset = true;
+    g_nr.width = g_nr.height = g_nr.workWidth = g_nr.workHeight = 0;
+    g_captureWriteAtFrame = 0;
+    if (g_generationDevice != nullptr)
+    {
+        g_generationDevice->Release();
+        g_generationDevice = nullptr;
+    }
+}
+
+void NotifyDeviceInit(ID3D12Device* device)
+{
+    std::lock_guard<std::recursive_mutex> lifecycleLock(g_lifecycleMutex);
+    if (device != nullptr && !g_shutdownFailed)
+        g_sessionClosed = false;
 }
 } // namespace DlssNr

@@ -48,6 +48,7 @@ unsigned int Run(ID3D12GraphicsCommandList* cmdList, ID3D12Device* device, ID3D1
 
 // Drops the feature and its parameter block, for a resolution change or shutdown.
 void Release();
+// Ends the NGX generation, including retry and parameter-discovery state.
+void Shutdown();
 } // namespace Proxy
 } // namespace DlssNr
-

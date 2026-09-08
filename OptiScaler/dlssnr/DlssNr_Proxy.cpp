@@ -85,6 +85,7 @@ struct ProxyState
     unsigned int height = 0;
 
     bool failed = false;
+    bool reinitialised = false;
 };
 
 ProxyState g_proxy;
@@ -128,7 +129,8 @@ namespace Proxy
 bool Available()
 {
     return NVNGXProxy::IsDx12Inited() && NVNGXProxy::D3D12_GetCapabilityParameters() != nullptr &&
-           NVNGXProxy::D3D12_CreateFeature() != nullptr && NVNGXProxy::D3D12_EvaluateFeature() != nullptr;
+           NVNGXProxy::D3D12_CreateFeature() != nullptr && NVNGXProxy::D3D12_EvaluateFeature() != nullptr &&
+           NVNGXProxy::D3D12_ReleaseFeature() != nullptr && NVNGXProxy::D3D12_DestroyParameters() != nullptr;
 }
 
 void Release()
@@ -136,12 +138,22 @@ void Release()
     if (g_proxy.feature != nullptr && NVNGXProxy::D3D12_ReleaseFeature() != nullptr)
         NVNGXProxy::D3D12_ReleaseFeature()(g_proxy.feature);
 
-    // The capability block belongs to the driver core and is shared with the game's own DLSS, so it
-    // is dropped here, never destroyed.
+    // GetCapabilityParameters returns a caller-owned block. Destroy it after its feature, while
+    // the NGX core is still initialized.
+    if (g_proxy.params != nullptr && NVNGXProxy::D3D12_DestroyParameters() != nullptr)
+        NVNGXProxy::D3D12_DestroyParameters()(g_proxy.params);
+
     g_proxy.feature = nullptr;
     g_proxy.params = nullptr;
     g_proxy.width = 0;
     g_proxy.height = 0;
+    g_floatSlot = -1;
+}
+
+void Shutdown()
+{
+    Release();
+    g_proxy = {};
 }
 
 unsigned int Run(ID3D12GraphicsCommandList* cmdList, ID3D12Device* device, ID3D12Resource* color,
@@ -168,9 +180,7 @@ unsigned int Run(ID3D12GraphicsCommandList* cmdList, ID3D12Device* device, ID3D1
         // a feature expects at create time; an allocated block has none of them, so the dispatcher
         // finds the feature and then has nothing to build it with.
         //
-        // The cost is that this block is shared with the game's own DLSS, which overwrites values
-        // between frames. That is why everything the feature reads is written again at evaluate
-        // below rather than trusted to survive from create.
+        // This populated block is owned by this proxy until Release().
         if (NVNGXProxy::D3D12_GetCapabilityParameters()(&g_proxy.params) != NVSDK_NGX_Result_Success ||
             g_proxy.params == nullptr)
         {
@@ -197,11 +207,9 @@ unsigned int Run(ID3D12GraphicsCommandList* cmdList, ID3D12Device* device, ID3D1
         // This is intrusive. It re-initialises the core the game's own DLSS is using, which is why
         // the whole proxy path is off by default and why this happens once, guarded, rather than
         // every frame.
-        static bool reinitialised = false;
-
-        if (!reinitialised && NVNGXProxy::D3D12_Init_Ext() != nullptr && device != nullptr)
+        if (!g_proxy.reinitialised && NVNGXProxy::D3D12_Init_Ext() != nullptr && device != nullptr)
         {
-            reinitialised = true;
+            g_proxy.reinitialised = true;
 
             NVSDK_NGX_FeatureCommonInfo fcInfo {};
             NVNGXProxy::GetFeatureCommonInfo(&fcInfo);
@@ -295,4 +303,3 @@ unsigned int Run(ID3D12GraphicsCommandList* cmdList, ID3D12Device* device, ID3D1
 }
 } // namespace Proxy
 } // namespace DlssNr
-
