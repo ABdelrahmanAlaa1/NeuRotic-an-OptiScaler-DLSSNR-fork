@@ -118,9 +118,9 @@ void RenderMenu(Config* config, float menuResScale)
                    "native DLSS Super Resolution. Ray Reconstruction already denoises and reconstructs "
                    "to the final output in one mode-aware pass, so NR remains after RR in both modes.");
 
-        bool enabled = config->DlssNrEnabled.value_or_default();
+        bool enabled = config->GetDlssNrRuntimeSnapshot().enabled;
         if (ImGui::Checkbox("Enable Neural Rendering", &enabled))
-            config->DlssNrEnabled = enabled;
+            config->SetDlssNrEnabled(enabled);
 
         // Keep the keybind guidance attached to the setting it describes.
         ImGui::TextDisabled("Can be toggled with a key -- bind it under Keybinds, \"Neural Rendering\".");

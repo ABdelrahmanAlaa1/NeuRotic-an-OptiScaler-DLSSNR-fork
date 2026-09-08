@@ -312,7 +312,7 @@ void Adopt(ID3D12Resource* resource, const std::string& shape, unsigned int byte
 
 void NoteResource(const D3D12_RESOURCE_DESC* desc, ID3D12Resource* resource)
 {
-    if (!Config::Instance()->DlssNrEnabled.value_or_default())
+    if (!Config::Instance()->GetDlssNrRuntimeSnapshot().enabled)
         return;
 
     if (desc == nullptr || resource == nullptr)
@@ -366,7 +366,7 @@ void NoteUav(ID3D12Resource* resource, const D3D12_UNORDERED_ACCESS_VIEW_DESC* d
     //
     // Recording is a resource description and a pointer. What is genuinely risky -- reading a buffer
     // the game owns, on an assumption about its state -- lives in Tick, and that is still gated.
-    if (!Config::Instance()->DlssNrEnabled.value_or_default())
+    if (!Config::Instance()->GetDlssNrRuntimeSnapshot().enabled)
         return;
 
     if (resource == nullptr)

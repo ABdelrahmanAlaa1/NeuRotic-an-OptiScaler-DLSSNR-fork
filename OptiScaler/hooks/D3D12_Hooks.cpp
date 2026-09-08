@@ -2199,7 +2199,7 @@ static void HookToDevice(ID3D12Device* InDevice)
         // GetResourceAllocationInfo, which the scan has no use for, and attaching a detour nobody
         // asked for is how a hook becomes a bug report in a game nobody was thinking about.
         const bool wantSpoof = Config::Instance()->UESpoofIntelAtomics64.value_or_default();
-        const bool wantScan = Config::Instance()->DlssNrEnabled.value_or_default();
+        const bool wantScan = Config::Instance()->GetDlssNrRuntimeSnapshot().enabled;
 
         if (wantSpoof)
         {

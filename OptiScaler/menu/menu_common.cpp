@@ -1370,13 +1370,14 @@ void MenuCommon::HandleMenuShortcuts(RenderMenuContext& ctx)
         if (inputDlssNr)
         {
             inputDlssNr = false;
-            config->DlssNrEnabled = !config->DlssNrEnabled.value_or_default();
+            const bool enabled = !config->GetDlssNrRuntimeSnapshot().enabled;
+            config->SetDlssNrEnabled(enabled);
             LOG_DEBUG("Neural Rendering toggle key pressed, setting DlssNrEnabled to {}",
-                      config->DlssNrEnabled.value_or_default());
+                      enabled);
 
             ImGuiToast toast { ImGuiToastType::Info, 2000 };
             toast.setTitle("DLSS Neural Rendering");
-            toast.setContent(config->DlssNrEnabled.value_or_default() ? "On" : "Off");
+            toast.setContent(enabled ? "On" : "Off");
             ImGui::InsertNotification(toast);
         }
 

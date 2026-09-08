@@ -192,7 +192,7 @@ static VkResult hkvkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevice
     // not start.
     DlssNr::VkExt::Merged nrExtensions;
 
-    if (Config::Instance()->DlssNrEnabled.value_or_default())
+    if (Config::Instance()->GetDlssNrRuntimeSnapshot().enabled)
     {
         const auto supported = DlssNr::VkExt::SupportedDeviceExtensions(
             o_vkGetInstanceProcAddr, State::Instance().VulkanInstance, physicalDevice);
@@ -236,7 +236,7 @@ static VkResult hkvkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevice
 
     auto result = o_vkCreateDevice(physicalDevice, &localCreteInfo, pAllocator, pDevice);
 
-    if (Config::Instance()->DlssNrEnabled.value_or_default())
+    if (Config::Instance()->GetDlssNrRuntimeSnapshot().enabled)
         LOG_INFO("DLSS-NR Vulkan: vkCreateDevice returned {} with {} extensions requested", (int) result,
                  localCreteInfo.enabledExtensionCount);
 

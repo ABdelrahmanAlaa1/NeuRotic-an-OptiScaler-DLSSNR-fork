@@ -46,6 +46,34 @@ Config::Config()
     Reload(absoluteFileName);
 }
 
+void Config::PublishDlssNrEnabled(bool enabled) noexcept
+{
+    uint64_t current = _dlssNrRuntimeState.load(std::memory_order_acquire);
+
+    for (;;)
+    {
+        if ((current & 1u) == static_cast<uint64_t>(enabled))
+            return;
+
+        const uint64_t next = enabled ? ((((current >> 1u) + 1u) << 1u) | 1u) : (current & ~uint64_t { 1u });
+        if (_dlssNrRuntimeState.compare_exchange_weak(current, next, std::memory_order_acq_rel,
+                                                      std::memory_order_acquire))
+            return;
+    }
+}
+
+void Config::SetDlssNrEnabled(bool enabled)
+{
+    DlssNrEnabled = enabled;
+    PublishDlssNrEnabled(enabled);
+}
+
+Config::DlssNrRuntimeSnapshot Config::GetDlssNrRuntimeSnapshot() const noexcept
+{
+    const uint64_t state = _dlssNrRuntimeState.load(std::memory_order_acquire);
+    return { (state & 1u) != 0, state >> 1u };
+}
+
 bool Config::Reload(std::filesystem::path iniPath)
 {
     auto pathWStr = iniPath.wstring();
@@ -317,6 +345,7 @@ bool Config::Reload(std::filesystem::path iniPath)
 
             // --- DLSS 5 Neural Rendering (OptiScaler/dlssnr) ---
             DlssNrEnabled.set_from_config(readBool("DlssNr", "Enabled"));
+            PublishDlssNrEnabled(DlssNrEnabled.value_or_default());
             // PerformanceMode is the user-facing name. Keep accepting the older experimental
             // key so profiles created before Alpha 0.4 retain their selected render path.
             auto performanceMode = readBool("DlssNr", "PerformanceMode");

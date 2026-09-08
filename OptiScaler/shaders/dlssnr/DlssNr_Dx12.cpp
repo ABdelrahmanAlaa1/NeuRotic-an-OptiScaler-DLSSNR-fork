@@ -399,6 +399,7 @@ struct NrState
     unsigned int width = 0;
     unsigned int height = 0;
     bool reset = true;
+    uint64_t resumeGeneration = 0;
 
     // Dimensions of the guides as the upscaler handed them over, kept for the present path, which runs
     // long after that call has returned.
@@ -1842,12 +1843,22 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
 {
     std::lock_guard<std::mutex> nrLock(g_nrMutex);
     const Config& cfg = *Config::Instance();
+    const auto runtime = cfg.GetDlssNrRuntimeSnapshot();
 
-    if (g_nr.failed || cmdList == nullptr || colour == nullptr || depth == nullptr ||
+    if (!runtime.enabled || g_nr.failed || cmdList == nullptr || colour == nullptr || depth == nullptr ||
         motion == nullptr || output == nullptr)
     {
-        ReportSkipOnce(g_nr.failed ? "it already failed this session" : "a resource was missing");
+        ReportSkipOnce(!runtime.enabled ? "it is switched off"
+                                        : (g_nr.failed ? "it already failed this session" : "a resource was missing"));
         return;
+    }
+
+    if (runtime.resumeGeneration != g_nr.resumeGeneration)
+    {
+        g_nr.resumeGeneration = runtime.resumeGeneration;
+        g_nr.reset = true;
+        LOG_INFO("DLSS-NR: enable transition {} applied at the D3D12 render boundary; temporal reset requested",
+                 runtime.resumeGeneration);
     }
 
     // Enough for meter/encode/downsample/resolve and the optional Pre-SR re-jitter. If the
@@ -3193,7 +3204,7 @@ ID3D12Resource* EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_
         return nullptr;
     const Config& cfg = *Config::Instance();
 
-    if (!cfg.DlssNrEnabled.value_or_default() || !cfg.DlssNrRunBeforeSr.value_or_default() ||
+    if (!cfg.GetDlssNrRuntimeSnapshot().enabled || !cfg.DlssNrRunBeforeSr.value_or_default() ||
         cmdList == nullptr || params == nullptr)
         return nullptr;
 
@@ -3673,7 +3684,7 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
     std::lock_guard<std::recursive_mutex> lifecycleLock(g_lifecycleMutex);
     if (g_sessionClosed || g_shutdownFailed)
         return;
-    if (!Config::Instance()->DlssNrEnabled.value_or_default())
+    if (!Config::Instance()->GetDlssNrRuntimeSnapshot().enabled)
     {
         ReportSkipOnce("it is switched off");
         return;

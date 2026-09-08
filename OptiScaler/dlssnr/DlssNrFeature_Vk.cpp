@@ -98,6 +98,7 @@ struct VkState
     uint32_t workWidth = 0;
     uint32_t workHeight = 0;
     bool reset = true;
+    uint64_t resumeGeneration = 0;
     unsigned long long frames = 0;
 
     // Timing. A pair of timestamps per frame across a ring, read back three frames later: a query
@@ -504,7 +505,7 @@ void EvaluateAfterUpscaleVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* para
 {
     auto& cfg = *Config::Instance();
 
-    if (!cfg.DlssNrEnabled.value_or_default())
+    if (!cfg.GetDlssNrRuntimeSnapshot().enabled)
         return;
 
     if (cmdBuffer == VK_NULL_HANDLE || params == nullptr || device == VK_NULL_HANDLE ||
@@ -534,6 +535,18 @@ void EvaluateAfterUpscaleVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* para
 
     if (g_vk.failed)
         return;
+
+    const auto runtime = cfg.GetDlssNrRuntimeSnapshot();
+    if (!runtime.enabled)
+        return;
+
+    if (runtime.resumeGeneration != g_vk.resumeGeneration)
+    {
+        g_vk.resumeGeneration = runtime.resumeGeneration;
+        g_vk.reset = true;
+        LOG_INFO("DLSS-NR Vulkan: enable transition {} applied at the render boundary; temporal reset requested",
+                 runtime.resumeGeneration);
+    }
 
     // The game's own resources, already wrapped: NGX hands Vulkan resources over as
     // NVSDK_NGX_Resource_VK, so only this pass's own images need building.

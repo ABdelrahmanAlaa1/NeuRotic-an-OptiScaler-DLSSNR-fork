@@ -3,6 +3,7 @@
 #include "SysUtils.h"
 #include "State.h"
 
+#include <atomic>
 #include <optional>
 #include <filesystem>
 
@@ -224,6 +225,12 @@ enum class LowLatencyMode : uint32_t
 class Config
 {
   public:
+    struct DlssNrRuntimeSnapshot
+    {
+        bool enabled = false;
+        uint64_t resumeGeneration = 0;
+    };
+
     Config();
 
     // Init flags
@@ -257,6 +264,11 @@ class Config
     // DLSS Neural Rendering: a detail-synthesis pass over the upscaler's output. Off by default -- it is
     // an undocumented feature driven directly through its snippet, not something NVIDIA exposes.
     CustomOptional<bool> DlssNrEnabled { false };
+    // Runtime readers execute on rendering and hook threads. Keep them off CustomOptional, whose
+    // std::optional storage is intentionally not atomic, and publish the enable bit together with
+    // an off->on generation so a resumed model cannot reuse temporal history across skipped frames.
+    void SetDlssNrEnabled(bool enabled);
+    DlssNrRuntimeSnapshot GetDlssNrRuntimeSnapshot() const noexcept;
     CustomOptional<bool> DlssNrRunBeforeSr { false }; // experimental: run NR before DLSS SR
     // 0 = Quality (post-SR), 1 = Performance (pre-SR).
     // Keep the legacy boolean as the routing compatibility surface for existing callers/configurations.
@@ -921,6 +933,9 @@ class Config
   private:
     inline static Config* _config;
     inline static std::vector<std::string> _log;
+
+    void PublishDlssNrEnabled(bool enabled) noexcept;
+    std::atomic<uint64_t> _dlssNrRuntimeState { 0 };
 
     std::filesystem::path absoluteFileName;
     std::wstring fileName = L"OptiScaler.ini";
