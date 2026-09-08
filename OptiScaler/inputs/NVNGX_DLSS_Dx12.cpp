@@ -824,6 +824,8 @@ static NVSDK_NGX_Result TryCreateOptiFeature(ID3D12GraphicsCommandList* InCmdLis
 
     void* originalColor = nullptr;
     void* originalOutput = nullptr;
+    unsigned int originalWidth = 0;
+    unsigned int originalHeight = 0;
     unsigned int originalOutWidth = 0;
     unsigned int originalOutHeight = 0;
     bool rrPipelinePrepared = false;
@@ -832,6 +834,8 @@ static NVSDK_NGX_Result TryCreateOptiFeature(ID3D12GraphicsCommandList* InCmdLis
     if (InFeatureID == NVSDK_NGX_Feature_RayReconstruction && InParameters != nullptr &&
         InParameters->Get(NVSDK_NGX_Parameter_Color, &originalColor) == NVSDK_NGX_Result_Success &&
         InParameters->Get(NVSDK_NGX_Parameter_Output, &originalOutput) == NVSDK_NGX_Result_Success &&
+        InParameters->Get(NVSDK_NGX_Parameter_Width, &originalWidth) == NVSDK_NGX_Result_Success &&
+        InParameters->Get(NVSDK_NGX_Parameter_Height, &originalHeight) == NVSDK_NGX_Result_Success &&
         InParameters->Get(NVSDK_NGX_Parameter_OutWidth, &originalOutWidth) == NVSDK_NGX_Result_Success &&
         InParameters->Get(NVSDK_NGX_Parameter_OutHeight, &originalOutHeight) == NVSDK_NGX_Result_Success &&
         originalColor != nullptr && originalOutput != nullptr)
@@ -844,11 +848,14 @@ static NVSDK_NGX_Result TryCreateOptiFeature(ID3D12GraphicsCommandList* InCmdLis
                               static_cast<ID3D12Resource*>(originalOutput), pendingRrPipeline.rrBaseOutput))
         {
             InParameters->Set(NVSDK_NGX_Parameter_Output, pendingRrPipeline.rrBaseOutput.Get());
+            InParameters->Set(NVSDK_NGX_Parameter_Width, pendingRrPipeline.baseWidth);
+            InParameters->Set(NVSDK_NGX_Parameter_Height, pendingRrPipeline.baseHeight);
             InParameters->Set(NVSDK_NGX_Parameter_OutWidth, pendingRrPipeline.baseWidth);
             InParameters->Set(NVSDK_NGX_Parameter_OutHeight, pendingRrPipeline.baseHeight);
             rrPipelinePrepared = true;
-            LOG_INFO("DLSS-NR Test 1.0: creating base RR at {}x{} before native DLSS SR to {}x{}",
-                     pendingRrPipeline.baseWidth, pendingRrPipeline.baseHeight, originalOutWidth, originalOutHeight);
+            LOG_INFO("DLSS-NR: creating RR and native SR with base input {}x{} (game reported {}x{}) and output {}x{}",
+                     pendingRrPipeline.baseWidth, pendingRrPipeline.baseHeight,
+                     originalWidth, originalHeight, originalOutWidth, originalOutHeight);
         }
     }
 
@@ -887,6 +894,8 @@ static NVSDK_NGX_Result TryCreateOptiFeature(ID3D12GraphicsCommandList* InCmdLis
         if (rrPipelinePrepared)
         {
             InParameters->Set(NVSDK_NGX_Parameter_Output, originalOutput);
+            InParameters->Set(NVSDK_NGX_Parameter_Width, originalWidth);
+            InParameters->Set(NVSDK_NGX_Parameter_Height, originalHeight);
             InParameters->Set(NVSDK_NGX_Parameter_OutWidth, originalOutWidth);
             InParameters->Set(NVSDK_NGX_Parameter_OutHeight, originalOutHeight);
         }
@@ -914,6 +923,8 @@ static NVSDK_NGX_Result TryCreateOptiFeature(ID3D12GraphicsCommandList* InCmdLis
     if (rrPipelinePrepared)
     {
         InParameters->Set(NVSDK_NGX_Parameter_Output, originalOutput);
+        InParameters->Set(NVSDK_NGX_Parameter_Width, originalWidth);
+        InParameters->Set(NVSDK_NGX_Parameter_Height, originalHeight);
         InParameters->Set(NVSDK_NGX_Parameter_OutWidth, originalOutWidth);
         InParameters->Set(NVSDK_NGX_Parameter_OutHeight, originalOutHeight);
     }
@@ -921,10 +932,14 @@ static NVSDK_NGX_Result TryCreateOptiFeature(ID3D12GraphicsCommandList* InCmdLis
     if (featureInitialized && rrPipelinePrepared)
     {
         InParameters->Set(NVSDK_NGX_Parameter_Color, pendingRrPipeline.rrBaseOutput.Get());
+        InParameters->Set(NVSDK_NGX_Parameter_Width, pendingRrPipeline.baseWidth);
+        InParameters->Set(NVSDK_NGX_Parameter_Height, pendingRrPipeline.baseHeight);
         pendingRrPipeline.finalDlss =
             std::make_unique<DLSSFeatureDx12>(IFeature::GetNextHandleId(), InParameters);
         const bool dlssInitialized = pendingRrPipeline.finalDlss->Init(D3D12Device, InCmdList, InParameters);
         InParameters->Set(NVSDK_NGX_Parameter_Color, originalColor);
+        InParameters->Set(NVSDK_NGX_Parameter_Width, originalWidth);
+        InParameters->Set(NVSDK_NGX_Parameter_Height, originalHeight);
 
         if (!dlssInitialized)
         {
@@ -1477,14 +1492,20 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
 
         void* originalColor = nullptr;
         void* originalOutput = nullptr;
+        unsigned int originalWidth = 0;
+        unsigned int originalHeight = 0;
         unsigned int originalOutWidth = 0;
         unsigned int originalOutHeight = 0;
         InParameters->Get(NVSDK_NGX_Parameter_Color, &originalColor);
         InParameters->Get(NVSDK_NGX_Parameter_Output, &originalOutput);
+        InParameters->Get(NVSDK_NGX_Parameter_Width, &originalWidth);
+        InParameters->Get(NVSDK_NGX_Parameter_Height, &originalHeight);
         InParameters->Get(NVSDK_NGX_Parameter_OutWidth, &originalOutWidth);
         InParameters->Get(NVSDK_NGX_Parameter_OutHeight, &originalOutHeight);
 
         InParameters->Set(NVSDK_NGX_Parameter_Output, pipeline.rrBaseOutput.Get());
+        InParameters->Set(NVSDK_NGX_Parameter_Width, pipeline.baseWidth);
+        InParameters->Set(NVSDK_NGX_Parameter_Height, pipeline.baseHeight);
         InParameters->Set(NVSDK_NGX_Parameter_OutWidth, pipeline.baseWidth);
         InParameters->Set(NVSDK_NGX_Parameter_OutHeight, pipeline.baseHeight);
         const NVSDK_NGX_Result rrResult =
@@ -1499,6 +1520,8 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
 
             InParameters->Set(NVSDK_NGX_Parameter_Color, pipeline.rrBaseOutput.Get());
             InParameters->Set(NVSDK_NGX_Parameter_Output, originalOutput);
+            InParameters->Set(NVSDK_NGX_Parameter_Width, pipeline.baseWidth);
+            InParameters->Set(NVSDK_NGX_Parameter_Height, pipeline.baseHeight);
             InParameters->Set(NVSDK_NGX_Parameter_OutWidth, originalOutWidth);
             InParameters->Set(NVSDK_NGX_Parameter_OutHeight, originalOutHeight);
 
@@ -1511,6 +1534,8 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
 
         InParameters->Set(NVSDK_NGX_Parameter_Color, originalColor);
         InParameters->Set(NVSDK_NGX_Parameter_Output, originalOutput);
+        InParameters->Set(NVSDK_NGX_Parameter_Width, originalWidth);
+        InParameters->Set(NVSDK_NGX_Parameter_Height, originalHeight);
         InParameters->Set(NVSDK_NGX_Parameter_OutWidth, originalOutWidth);
         InParameters->Set(NVSDK_NGX_Parameter_OutHeight, originalOutHeight);
         DlssNr::RestoreAfterUpscale(InParameters);
