@@ -97,6 +97,11 @@ int main() {
     const int beforeAbandon = shutdownCalls;
     assert(dlssnr_vk_shutdown(0) == 1 && shutdownCalls == beforeAbandon);
     assert(!g_vk.initialised && !g_vk.device);
+    assert(dlssnr_vk_init(L"unused", L"unused", nullptr, nullptr, deviceA, 21) != 1);
+    assert(dlssnr_vk_shutdown(1) == 1 && shutdownCalls == beforeAbandon);
+    assert(dlssnr_vk_init(L"unused", L"unused", nullptr, nullptr, deviceA, 21) != 1);
+    // New process fixture: abandonment cannot be repaired by resetting only host handles.
+    g_vk.abandoned = false;
     assert(dlssnr_vk_init(L"unused", L"unused", nullptr, nullptr, deviceA, 21) == 1);
     shutdownResult = -9;
     assert(dlssnr_vk_shutdown(1) == -9 && g_vk.initialised);

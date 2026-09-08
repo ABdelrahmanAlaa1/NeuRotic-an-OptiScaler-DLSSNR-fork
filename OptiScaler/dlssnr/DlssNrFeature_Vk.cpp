@@ -522,6 +522,11 @@ void EvaluateAfterUpscaleVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* para
     if (g_vk.device != device)
     {
         ShutdownVkLocked(false);
+        if (g_vkShutdownFailed)
+        {
+            Fail("device changed without NGX shutdown; restart the process");
+            return;
+        }
         g_vk.device = device;
     }
     g_vk.instance = instance;
@@ -1150,6 +1155,8 @@ static void ShutdownVkLocked(bool deviceAlive)
 {
     if (!deviceAlive)
     {
+        if (g_vk.ngxInitialised)
+            g_vkShutdownFailed = true;
         // The device these handles belong to is gone (a device change was detected). Destroying a
         // VkDevice already frees every resource created on it, so touch NOTHING on the old device --
         // no wait-idle, no vkDestroy*, no NGX release, and crucially no DlssNr_Vk destructor (it would

@@ -26,7 +26,8 @@ Those existing fixes are retained. Remaining changes:
 - Host Pre-SR/After-SR evaluation and teardown are serialized. Session closure blocks new
   NR evaluations until explicit host initialization. This is not a general menu/config race fix.
 - Vulkan checks device identity before reading old mapped memory. Its pre-existing
-  unannounced-device-loss abandonment policy is retained, with forwarder state reset.
+  unannounced-device-loss handle abandonment is retained, but reinitialization is blocked
+  for the remainder of the process: host flag reset cannot reset the model's internal device.
   Abandoned driver-owned parameter memory is not dereferenced on a presumed dead generation.
 
 ## Configuration and deployment
@@ -57,5 +58,5 @@ GPU completion fences, ring reuse, retirement, readback completion, general shar
 synchronization, and resource-state error epilogues belong to subsequent checkpoints.
 In particular, this checkpoint does not certify teardown while unsubmitted/pending game
 command lists still reference NR resources. The host must quiesce rendering before shutdown.
-Vulkan unannounced device replacement retains the prior assumption that the old device was
-destroyed; multi-live-device support is not added here.
+Vulkan unannounced device replacement does not call the old device or restart the snippet;
+it requires a process restart. Multi-live-device support is not added here.

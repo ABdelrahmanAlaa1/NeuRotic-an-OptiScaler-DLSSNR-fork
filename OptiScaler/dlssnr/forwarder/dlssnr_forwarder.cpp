@@ -167,6 +167,7 @@ struct VkSnippet {
     PFN_NrShutdown shutdown = nullptr;
     bool initialised = false;
     void *device = nullptr;
+    bool abandoned = false;
 };
 
 VkSnippet g_vk;
@@ -620,7 +621,7 @@ __declspec(dllexport) int dlssnr_vk_probe(const wchar_t *snippetPath) {
 __declspec(dllexport) int dlssnr_vk_init(const wchar_t *snippetPath, const wchar_t *dataPath,
                                          void *instance, void *physicalDevice, void *device,
                                          int sdkVersion) {
-    if (!loadVkSnippet(snippetPath) || g_vk.init == nullptr || g_vk.shutdown == nullptr) {
+    if (g_vk.abandoned || !loadVkSnippet(snippetPath) || g_vk.init == nullptr || g_vk.shutdown == nullptr) {
         return -1;
     }
 
@@ -643,6 +644,9 @@ __declspec(dllexport) int dlssnr_vk_init(const wchar_t *snippetPath, const wchar
 // deviceAlive=false is the existing lost-device abandonment path: do not enter the dead driver.
 __declspec(dllexport) int dlssnr_vk_shutdown(int deviceAlive) {
     volatile int result = 1;
+    // Forgetting our handles cannot reset the model's internal device pointer. After loss without
+    // shutdown, no native call is safe and this module must not initialize another generation.
+    if (!deviceAlive && g_vk.initialised) g_vk.abandoned = true;
     if (deviceAlive && g_vk.initialised) {
         if (!g_vk.shutdown) return -1;
         result = g_vk.shutdown();
