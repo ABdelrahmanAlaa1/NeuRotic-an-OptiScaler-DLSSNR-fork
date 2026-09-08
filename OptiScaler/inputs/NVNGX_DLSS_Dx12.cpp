@@ -827,6 +827,14 @@ static NVSDK_NGX_Result TryCreateOptiFeature(ID3D12GraphicsCommandList* InCmdLis
     unsigned int originalHeight = 0;
     unsigned int originalOutWidth = 0;
     unsigned int originalOutHeight = 0;
+    unsigned int originalSubrectWidth = 0;
+    unsigned int originalSubrectHeight = 0;
+    const bool hasOriginalSubrectDimensions =
+        InParameters != nullptr &&
+        InParameters->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, &originalSubrectWidth) ==
+            NVSDK_NGX_Result_Success &&
+        InParameters->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, &originalSubrectHeight) ==
+            NVSDK_NGX_Result_Success;
     bool rrPipelinePrepared = false;
     RrDlssPipeline pendingRrPipeline {};
 
@@ -850,6 +858,13 @@ static NVSDK_NGX_Result TryCreateOptiFeature(ID3D12GraphicsCommandList* InCmdLis
             InParameters->Set(NVSDK_NGX_Parameter_Height, pendingRrPipeline.baseHeight);
             InParameters->Set(NVSDK_NGX_Parameter_OutWidth, pendingRrPipeline.baseWidth);
             InParameters->Set(NVSDK_NGX_Parameter_OutHeight, pendingRrPipeline.baseHeight);
+            if (hasOriginalSubrectDimensions)
+            {
+                InParameters->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width,
+                                  pendingRrPipeline.baseWidth);
+                InParameters->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height,
+                                  pendingRrPipeline.baseHeight);
+            }
             rrPipelinePrepared = true;
             LOG_INFO("DLSS-NR: creating RR and native SR with logical base input {}x{} and output {}x{}",
                      pendingRrPipeline.baseWidth, pendingRrPipeline.baseHeight, originalOutWidth, originalOutHeight);
@@ -895,6 +910,11 @@ static NVSDK_NGX_Result TryCreateOptiFeature(ID3D12GraphicsCommandList* InCmdLis
             InParameters->Set(NVSDK_NGX_Parameter_Height, originalHeight);
             InParameters->Set(NVSDK_NGX_Parameter_OutWidth, originalOutWidth);
             InParameters->Set(NVSDK_NGX_Parameter_OutHeight, originalOutHeight);
+            if (hasOriginalSubrectDimensions)
+            {
+                InParameters->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, originalSubrectWidth);
+                InParameters->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, originalSubrectHeight);
+            }
         }
 
         D3D12Hooks::SetRootSignatureTracking(true);
@@ -924,6 +944,11 @@ static NVSDK_NGX_Result TryCreateOptiFeature(ID3D12GraphicsCommandList* InCmdLis
         InParameters->Set(NVSDK_NGX_Parameter_Height, originalHeight);
         InParameters->Set(NVSDK_NGX_Parameter_OutWidth, originalOutWidth);
         InParameters->Set(NVSDK_NGX_Parameter_OutHeight, originalOutHeight);
+        if (hasOriginalSubrectDimensions)
+        {
+            InParameters->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, originalSubrectWidth);
+            InParameters->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, originalSubrectHeight);
+        }
     }
 
     if (featureInitialized && rrPipelinePrepared)
@@ -931,12 +956,24 @@ static NVSDK_NGX_Result TryCreateOptiFeature(ID3D12GraphicsCommandList* InCmdLis
         InParameters->Set(NVSDK_NGX_Parameter_Color, pendingRrPipeline.rrBaseOutput.Get());
         InParameters->Set(NVSDK_NGX_Parameter_Width, pendingRrPipeline.baseWidth);
         InParameters->Set(NVSDK_NGX_Parameter_Height, pendingRrPipeline.baseHeight);
+        if (hasOriginalSubrectDimensions)
+        {
+            InParameters->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width,
+                              pendingRrPipeline.baseWidth);
+            InParameters->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height,
+                              pendingRrPipeline.baseHeight);
+        }
         pendingRrPipeline.finalDlss =
             std::make_unique<DLSSFeatureDx12>(IFeature::GetNextHandleId(), InParameters);
         const bool dlssInitialized = pendingRrPipeline.finalDlss->Init(D3D12Device, InCmdList, InParameters);
         InParameters->Set(NVSDK_NGX_Parameter_Color, originalColor);
         InParameters->Set(NVSDK_NGX_Parameter_Width, originalWidth);
         InParameters->Set(NVSDK_NGX_Parameter_Height, originalHeight);
+        if (hasOriginalSubrectDimensions)
+        {
+            InParameters->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, originalSubrectWidth);
+            InParameters->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, originalSubrectHeight);
+        }
 
         if (!dlssInitialized)
         {
@@ -1493,18 +1530,30 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
         unsigned int originalHeight = 0;
         unsigned int originalOutWidth = 0;
         unsigned int originalOutHeight = 0;
+        unsigned int originalSubrectWidth = 0;
+        unsigned int originalSubrectHeight = 0;
         InParameters->Get(NVSDK_NGX_Parameter_Color, &originalColor);
         InParameters->Get(NVSDK_NGX_Parameter_Output, &originalOutput);
         InParameters->Get(NVSDK_NGX_Parameter_Width, &originalWidth);
         InParameters->Get(NVSDK_NGX_Parameter_Height, &originalHeight);
         InParameters->Get(NVSDK_NGX_Parameter_OutWidth, &originalOutWidth);
         InParameters->Get(NVSDK_NGX_Parameter_OutHeight, &originalOutHeight);
+        const bool hasOriginalSubrectDimensions =
+            InParameters->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, &originalSubrectWidth) ==
+                NVSDK_NGX_Result_Success &&
+            InParameters->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, &originalSubrectHeight) ==
+                NVSDK_NGX_Result_Success;
 
         InParameters->Set(NVSDK_NGX_Parameter_Output, pipeline.rrBaseOutput.Get());
         InParameters->Set(NVSDK_NGX_Parameter_Width, pipeline.baseWidth);
         InParameters->Set(NVSDK_NGX_Parameter_Height, pipeline.baseHeight);
         InParameters->Set(NVSDK_NGX_Parameter_OutWidth, pipeline.baseWidth);
         InParameters->Set(NVSDK_NGX_Parameter_OutHeight, pipeline.baseHeight);
+        if (hasOriginalSubrectDimensions)
+        {
+            InParameters->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, pipeline.baseWidth);
+            InParameters->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, pipeline.baseHeight);
+        }
         const NVSDK_NGX_Result rrResult =
             TryEvaluateOptiFeature(InCmdList, InFeatureHandle, InParameters, InCallback);
 
@@ -1535,6 +1584,11 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
         InParameters->Set(NVSDK_NGX_Parameter_Height, originalHeight);
         InParameters->Set(NVSDK_NGX_Parameter_OutWidth, originalOutWidth);
         InParameters->Set(NVSDK_NGX_Parameter_OutHeight, originalOutHeight);
+        if (hasOriginalSubrectDimensions)
+        {
+            InParameters->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, originalSubrectWidth);
+            InParameters->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, originalSubrectHeight);
+        }
         DlssNr::RestoreAfterUpscale(InParameters);
         return rrResult;
     }
