@@ -21,3 +21,11 @@ Therefore this experiment labels the option **Private Queue**, not Async. The mo
 ## Hypothesis
 
 The Alpha 0.9.1 dual route can be exposed as a clear three-mode UI while preserving one NR evaluation per rendered frame. A private queue may make NR feature creation/recreation safer on games sensitive to creation commands in the game command list; it is not expected to reduce steady-state NR model time.
+
+## Runtime evidence and known regression
+
+The three-mode test deployment was built from `72021358680bfff87b62120f2f444878a48ca29f` with the live INI preserved. Private Queue creation was observed repeatedly at `1920x1080`, with its direct queue, allocator, command list, and fence created successfully; each completion message states that per-frame NR remains on the game queue. It is therefore not an asynchronous per-frame mode.
+
+RR and the intended Performance route were observed during the broader test. However, live DLSS-mode changes exposed a transition defect: Quality/DLAA and Ultra Performance-to-Performance changes can produce incompatible in-flight dimensions, followed by repeated `DLSSD` evaluation failures (`0xbad00000`). This must be treated as a regression, not as evidence that those static DLSS modes are unsupported.
+
+On a clean restart with `DlssNr.RenderingMode = 1` (Performance), the RR evaluation reported that its base-resolution pipeline was unavailable. NR then ran at `3840x2160` while guides remained `1920x1080`, with approximately `16.6-17.1 ms` model time. A visible temporal ghosting/double-image artifact was reported around the player silhouette and fine detail. This is separate from the hard transition failure, but likely shares an ownership/resource-dimension/history mismatch. Do not promote this experiment. A future isolated repair should quarantine dispatch during resource changes, recreate only after dimensions stabilize, clear incompatible temporal history, and add independent RR/SR/NR per-frame counters before assessing image quality.
