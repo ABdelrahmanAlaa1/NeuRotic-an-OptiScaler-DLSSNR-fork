@@ -211,7 +211,7 @@ static VkImageInfo ImageInfoOf(const OwnedImage& img)
 
 bool CreateImage(OwnedImage& img, uint32_t width, uint32_t height, VkFormat format, bool readWrite)
 {
-    DestroyImage(img);
+    OwnedImage replacement;
 
     VkImageCreateInfo info {};
     info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -227,14 +227,14 @@ bool CreateImage(OwnedImage& img, uint32_t width, uint32_t height, VkFormat form
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-    if (vkCreateImage(g_vk.device, &info, nullptr, &img.image) != VK_SUCCESS)
+    if (vkCreateImage(g_vk.device, &info, nullptr, &replacement.image) != VK_SUCCESS)
     {
         LOG_ERROR("DLSS-NR Vulkan: could not create a {}x{} image", width, height);
         return false;
     }
 
     VkMemoryRequirements req {};
-    vkGetImageMemoryRequirements(g_vk.device, img.image, &req);
+    vkGetImageMemoryRequirements(g_vk.device, replacement.image, &req);
 
     VkMemoryAllocateInfo alloc {};
     alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
@@ -242,28 +242,32 @@ bool CreateImage(OwnedImage& img, uint32_t width, uint32_t height, VkFormat form
     alloc.memoryTypeIndex = FindMemoryTypeIndex(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
     if (alloc.memoryTypeIndex == UINT32_MAX ||
-        vkAllocateMemory(g_vk.device, &alloc, nullptr, &img.memory) != VK_SUCCESS ||
-        vkBindImageMemory(g_vk.device, img.image, img.memory, 0) != VK_SUCCESS)
+        vkAllocateMemory(g_vk.device, &alloc, nullptr, &replacement.memory) != VK_SUCCESS ||
+        vkBindImageMemory(g_vk.device, replacement.image, replacement.memory, 0) != VK_SUCCESS)
     {
         LOG_ERROR("DLSS-NR Vulkan: could not back a {}x{} image", width, height);
-        DestroyImage(img);
+        DestroyImage(replacement);
         return false;
     }
 
     VkImageViewCreateInfo view {};
     view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    view.image = img.image;
+    view.image = replacement.image;
     view.viewType = VK_IMAGE_VIEW_TYPE_2D;
     view.format = format;
     view.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
-    if (vkCreateImageView(g_vk.device, &view, nullptr, &img.view) != VK_SUCCESS)
+    if (vkCreateImageView(g_vk.device, &view, nullptr, &replacement.view) != VK_SUCCESS)
     {
         LOG_ERROR("DLSS-NR Vulkan: could not view a {}x{} image", width, height);
-        DestroyImage(img);
+        DestroyImage(replacement);
         return false;
     }
 
+    // Existing callers drain before replacing live images. Preserve that lifetime policy,
+    // but do not discard the old image until the replacement has memory and a usable view.
+    DestroyImage(img);
+    img = replacement;
     img.width = width;
     img.height = height;
     img.format = format;
@@ -287,6 +291,18 @@ bool CreateImage(OwnedImage& img, uint32_t width, uint32_t height, VkFormat form
 // small and the alternative is a vkInvalidateMappedMemoryRanges on a path that runs every frame.
 bool CreateMeterReadback()
 {
+    VkBuffer buffers[kMeterSlots] {};
+    VkDeviceMemory memory[kMeterSlots] {};
+    void* mapped[kMeterSlots] {};
+    const auto discard = [&]()
+    {
+        for (size_t i = 0; i < kMeterSlots; ++i)
+        {
+            if (mapped[i] != nullptr) vkUnmapMemory(g_vk.device, memory[i]);
+            if (buffers[i] != VK_NULL_HANDLE) vkDestroyBuffer(g_vk.device, buffers[i], nullptr);
+            if (memory[i] != VK_NULL_HANDLE) vkFreeMemory(g_vk.device, memory[i], nullptr);
+        }
+    };
     for (unsigned long long i = 0; i < kMeterSlots; ++i)
     {
         if (g_vk.meterReadback[i] != VK_NULL_HANDLE)
@@ -298,14 +314,15 @@ bool CreateMeterReadback()
         info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-        if (vkCreateBuffer(g_vk.device, &info, nullptr, &g_vk.meterReadback[i]) != VK_SUCCESS)
+        if (vkCreateBuffer(g_vk.device, &info, nullptr, &buffers[i]) != VK_SUCCESS)
         {
             LOG_WARN("DLSS-NR Vulkan: could not create the exposure readback buffer");
+            discard();
             return false;
         }
 
         VkMemoryRequirements req {};
-        vkGetBufferMemoryRequirements(g_vk.device, g_vk.meterReadback[i], &req);
+        vkGetBufferMemoryRequirements(g_vk.device, buffers[i], &req);
 
         VkMemoryAllocateInfo alloc {};
         alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
@@ -314,16 +331,24 @@ bool CreateMeterReadback()
             req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
         if (alloc.memoryTypeIndex == UINT32_MAX ||
-            vkAllocateMemory(g_vk.device, &alloc, nullptr, &g_vk.meterReadbackMemory[i]) != VK_SUCCESS ||
-            vkBindBufferMemory(g_vk.device, g_vk.meterReadback[i], g_vk.meterReadbackMemory[i], 0) != VK_SUCCESS ||
-            vkMapMemory(g_vk.device, g_vk.meterReadbackMemory[i], 0, kMeterBytes, 0, &g_vk.meterMapped[i]) !=
+            vkAllocateMemory(g_vk.device, &alloc, nullptr, &memory[i]) != VK_SUCCESS ||
+            vkBindBufferMemory(g_vk.device, buffers[i], memory[i], 0) != VK_SUCCESS ||
+            vkMapMemory(g_vk.device, memory[i], 0, kMeterBytes, 0, &mapped[i]) !=
                 VK_SUCCESS)
         {
             LOG_WARN("DLSS-NR Vulkan: could not back the exposure readback buffer");
+            discard();
             return false;
         }
     }
 
+    for (size_t i = 0; i < kMeterSlots; ++i)
+    {
+        if (buffers[i] == VK_NULL_HANDLE) continue;
+        g_vk.meterReadback[i] = buffers[i];
+        g_vk.meterReadbackMemory[i] = memory[i];
+        g_vk.meterMapped[i] = mapped[i];
+    }
     return true;
 }
 
@@ -490,20 +515,50 @@ std::optional<std::filesystem::path> FindSnippet()
 
 // ---------------------------------------------------------------------------------------------
 
-bool IsRunningVk() { return g_vk.feature != nullptr && !g_vk.failed; }
+bool IsRunningVk()
+{
+    std::lock_guard<std::mutex> lock(g_vkMutex);
+    const auto runtime = Config::Instance()->GetDlssNrRuntimeSnapshot();
+    return runtime.enabled && !g_vkSessionClosed && !g_vkShutdownFailed &&
+           g_vk.feature != nullptr && !g_vk.failed && g_vk.frames != 0 && !g_vk.reset &&
+           runtime.resumeGeneration == g_vk.resumeGeneration;
+}
 
-const char* FailureReasonVk() { return g_vk.failed ? g_vk.reason : ""; }
+const char* FailureReasonVk()
+{
+    std::lock_guard<std::mutex> lock(g_vkMutex);
+    return g_vkShutdownFailed ? "Vulkan shutdown could not safely complete; restart the process"
+                             : (g_vk.failed ? g_vk.reason : "");
+}
 
-unsigned long long FramesVk() { return g_vk.frames; }
+unsigned long long FramesVk()
+{
+    std::lock_guard<std::mutex> lock(g_vkMutex);
+    return g_vk.frames;
+}
 
-bool ExposureOfferedVk() { return g_vk.exposureOffered; }
+bool ExposureOfferedVk()
+{
+    std::lock_guard<std::mutex> lock(g_vkMutex);
+    return g_vk.exposureOffered;
+}
 
-std::optional<double> LastGpuTimeVk() { return g_vk.lastGpuTime; }
+std::optional<double> LastGpuTimeVk()
+{
+    std::lock_guard<std::mutex> lock(g_vkMutex);
+    const auto runtime = Config::Instance()->GetDlssNrRuntimeSnapshot();
+    if (!runtime.enabled || g_vkSessionClosed || g_vkShutdownFailed || g_vk.failed || g_vk.reset ||
+        runtime.resumeGeneration != g_vk.resumeGeneration)
+        return {};
+    return g_vk.lastGpuTime;
+}
 
 void EvaluateAfterUpscaleVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* params, VkInstance instance,
                             VkPhysicalDevice physicalDevice, VkDevice device)
 {
-    auto& cfg = *Config::Instance();
+    const auto settings = TryNrConfigSnapshot(*Config::Instance());
+    if (!settings) return;
+    const auto& cfg = *settings;
 
     if (!cfg.GetDlssNrRuntimeSnapshot().enabled)
         return;
@@ -1077,15 +1132,15 @@ void EvaluateAfterUpscaleVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* para
         cfg.DlssNrLocalStructure.value_or_default(), cfg.DlssNrLocalTone.value_or_default(),
         cfg.DlssNrSkinStructure.value_or_default(), cfg.DlssNrAutoMask.value_or_default() ? 1 : 0, 1.0f, 1.0f);
 
-    g_vk.reset = false;
-    g_vk.frames++;
-
     if (evaluated != 1)
     {
         LOG_ERROR("DLSS-NR Vulkan: evaluate returned {}", evaluated);
         Fail("the model refused to evaluate");
         return;
     }
+
+    g_vk.reset = false;
+    g_vk.frames++;
 
     // -----------------------------------------------------------------------------------------
     // Resolve: proxy + the model's answer + the untouched copy -> the frame

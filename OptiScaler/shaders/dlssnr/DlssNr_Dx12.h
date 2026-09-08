@@ -30,6 +30,9 @@
 // If the pool is busy, the entry point bypasses NR before recording output transitions.
 #define DLSSNR_NUM_OF_HEAPS 48
 
+class Config;
+template<class Source> struct NrConfigSnapshot;
+
 class DlssNr_Dx12 : public Shader_Dx12, public DlssNr_Common
 {
   private:
@@ -71,7 +74,7 @@ class DlssNr_Dx12 : public Shader_Dx12, public DlssNr_Common
     // resource. timingQueue is the queue this list will be executed on, when the caller knows it.
     void Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* colour, ID3D12Resource* depth,
                   ID3D12Resource* motion, ID3D12Resource* output, const DlssNrFrameInfo& frame,
-                  ID3D12CommandQueue* timingQueue = nullptr);
+                  ID3D12CommandQueue* timingQueue, const NrConfigSnapshot<Config>& cfg);
 
     // Records one pass. Resources that a given mode does not read may be null; a stand-in is bound in
     // their place so every descriptor in the table is valid.

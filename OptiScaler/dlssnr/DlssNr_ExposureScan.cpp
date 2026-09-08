@@ -11,6 +11,7 @@
 #include "NrGpuSafety.h"
 #include <mutex>
 #include <string>
+#include <wrl/client.h>
 
 namespace DlssNr
 {
@@ -172,11 +173,17 @@ void Barrier(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* res, D3D12_RESO
     cmdList->ResourceBarrier(1, &barrier);
 }
 
-bool EnsureReadback(ID3D12Device* device)
+// The render lifecycle owns the ring and excludes Shutdown while this runs. Stage
+// only missing slots: failure releases this attempt's resources without publishing
+// a partial bundle or disturbing existing slots. Allocation (including reentrant
+// resource hooks) must stay outside g_scanMutex.
+template <typename Resource, typename Allocate>
+bool EnsureReadbackBundle(Resource* (&ring)[kSlots], Allocate&& allocate)
 {
+    Microsoft::WRL::ComPtr<Resource> staged[kSlots];
     for (unsigned int i = 0; i < kSlots; ++i)
     {
-        if (g_scan.readback[i] != nullptr)
+        if (ring[i] != nullptr)
             continue;
 
         D3D12_HEAP_PROPERTIES heap {};
@@ -192,16 +199,32 @@ bool EnsureReadback(ID3D12Device* device)
         desc.SampleDesc.Count = 1;
         desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
-        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-                                                   D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                                   IID_PPV_ARGS(&g_scan.readback[i]))))
-        {
-            g_scan.status = "could not allocate the readback buffers";
+        if (FAILED(allocate(heap, desc, staged[i].GetAddressOf())) || staged[i].Get() == nullptr)
             return false;
-        }
     }
 
+    for (unsigned int i = 0; i < kSlots; ++i)
+        if (staged[i].Get() != nullptr)
+            ring[i] = staged[i].Detach();
+
     return true;
+}
+
+bool EnsureReadback(ID3D12Device* device)
+{
+    const bool allocated = EnsureReadbackBundle(g_scan.readback,
+        [device](const D3D12_HEAP_PROPERTIES& heap, const D3D12_RESOURCE_DESC& desc,
+                 ID3D12Resource** resource) {
+            return device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                   D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                   IID_PPV_ARGS(resource));
+        });
+    if (!allocated)
+    {
+        std::lock_guard<std::mutex> lock(g_scanMutex);
+        g_scan.status = "could not allocate the readback buffers";
+    }
+    return allocated;
 }
 
 // Whether the scan should be running at all.
@@ -263,7 +286,7 @@ bool LooksLikeANumber(const D3D12_RESOURCE_DESC& rd, std::string* outShape, unsi
         // and 768 byte buffers that never held anything but zero, and the real answer -- eight bytes
         // -- only made the list because it happened to be created early. A cap that can be filled by
         // junk is a cap that can hide the answer.
-        if (rd.Width == 0 || rd.Width > 128)
+        if (rd.Width < sizeof(float) || rd.Width > 128)
             return false;
 
         *outIsBuffer = true;
@@ -593,12 +616,12 @@ void Tick(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList)
 // short enough that nobody waits on it wondering.
 constexpr unsigned int kPatience = 1800;
 
-Verdict Where()
+// Caller holds g_scanMutex. Keep verdict selection and any candidate indexing in one
+// critical section: feature release may otherwise clear the list between them.
+static Verdict WhereLocked(bool wanted)
 {
-    if (!Wanted())
+    if (!wanted)
         return Verdict::Off;
-
-    std::lock_guard<std::mutex> lock(g_scanMutex);
 
     if (g_scan.tracked.empty())
         return Verdict::Waiting;
@@ -616,11 +639,21 @@ Verdict Where()
     return mostReads >= kPatience ? Verdict::Barren : Verdict::Watching;
 }
 
+Verdict Where()
+{
+    const bool wanted = Wanted();
+    std::lock_guard<std::mutex> lock(g_scanMutex);
+    return WhereLocked(wanted);
+}
+
 const char* Headline()
 {
-    static std::string line;
+    // Each caller owns its returned text until its next call on this thread.
+    thread_local std::string line;
+    const bool wanted = Wanted();
+    std::lock_guard<std::mutex> lock(g_scanMutex);
 
-    switch (Where())
+    switch (WhereLocked(wanted))
     {
     case Verdict::Off:
         line = "";
@@ -631,7 +664,7 @@ const char* Headline()
         // The examined count is the whole diagnosis. Zero means the hook is not running and no
         // amount of playing will change that; a large number means the game genuinely has nothing
         // shaped like an exposure, which is an answer rather than a failure.
-        const unsigned int seen = Examined();
+        const unsigned int seen = g_scan.examined;
         line = seen == 0 ? "DLSS-NR exposure scan: NOT RUNNING -- no resources seen at all"
                          : "DLSS-NR exposure scan: examined " + std::to_string(seen) +
                                " resources, none shaped like an exposure";
@@ -640,7 +673,6 @@ const char* Headline()
 
     case Verdict::Watching:
     {
-        std::lock_guard<std::mutex> lock(g_scanMutex);
         unsigned int mostReads = 0;
 
         for (const Tracked& t : g_scan.tracked)
@@ -654,8 +686,6 @@ const char* Headline()
 
     case Verdict::Found:
     {
-        std::lock_guard<std::mutex> lock(g_scanMutex);
-
         // The widest travel wins where several move. An exposure swings by orders of magnitude
         // between a dark interior and open daylight; anything that merely wobbles is something else.
         size_t best = 0;

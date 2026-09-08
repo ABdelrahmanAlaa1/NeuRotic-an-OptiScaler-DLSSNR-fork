@@ -23,6 +23,7 @@ DlssNr_Vk::DlssNr_Vk(std::string InName, VkDevice InDevice, VkPhysicalDevice InP
     // model may have run at a reduced resolution and the edit has to be stretched back over the frame.
     // The D3D12 pass uses a linear sampler for the same reason and the two must agree.
     CreateSampler(VK_FILTER_LINEAR, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+    if (_textureSampler == VK_NULL_HANDLE) return;
 
     // The constant ring. A uniform buffer binding can be offset into, but only to a multiple of the
     // device's own alignment, so the stride is the struct rounded up rather than the struct itself.
@@ -63,6 +64,7 @@ DlssNr_Vk::DlssNr_Vk(std::string InName, VkDevice InDevice, VkPhysicalDevice InP
     };
 
     CreateLayouts(bindings);
+    if (_descriptorSetLayout == VK_NULL_HANDLE || _pipelineLayout == VK_NULL_HANDLE) return;
 
     std::vector<VkDescriptorPoolSize> poolSizes = {
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kSlots },
@@ -72,6 +74,7 @@ DlssNr_Vk::DlssNr_Vk(std::string InName, VkDevice InDevice, VkPhysicalDevice InP
     };
 
     CreateDescriptorPool(poolSizes, kSlots);
+    if (_descriptorPool == VK_NULL_HANDLE) return;
 
     // One set per slot rather than per frame: two dispatches in the same frame need two sets, or the
     // second overwrites bindings the first has not consumed yet.
@@ -79,7 +82,9 @@ DlssNr_Vk::DlssNr_Vk(std::string InName, VkDevice InDevice, VkPhysicalDevice InP
     CreateDescriptorSets(_descriptorSetLayout, _descriptorPool, _descriptorSets);
     _maxFramesInFlight = kFramesInFlight;
 
-    if (_descriptorSets.size() < kSlots)
+    if (_descriptorSets.size() < kSlots ||
+        std::any_of(_descriptorSets.begin(), _descriptorSets.end(),
+                    [](VkDescriptorSet set) { return set == VK_NULL_HANDLE; }))
     {
         LOG_ERROR("DLSS-NR Vulkan pass: expected {} descriptor sets, got {}", kSlots, _descriptorSets.size());
         _init = false;
@@ -125,6 +130,15 @@ bool DlssNr_Vk::CreateDummy(VkCommandBuffer cmdList)
 
     if (_dummyImage == VK_NULL_HANDLE)
     {
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkImageView imageView = VK_NULL_HANDLE;
+        const auto discard = [&]()
+        {
+            if (imageView != VK_NULL_HANDLE) vkDestroyImageView(_device, imageView, nullptr);
+            if (image != VK_NULL_HANDLE) vkDestroyImage(_device, image, nullptr);
+            if (memory != VK_NULL_HANDLE) vkFreeMemory(_device, memory, nullptr);
+        };
         VkImageCreateInfo info {};
         info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
         info.imageType = VK_IMAGE_TYPE_2D;
@@ -138,14 +152,14 @@ bool DlssNr_Vk::CreateDummy(VkCommandBuffer cmdList)
         info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-        if (vkCreateImage(_device, &info, nullptr, &_dummyImage) != VK_SUCCESS)
+        if (vkCreateImage(_device, &info, nullptr, &image) != VK_SUCCESS)
         {
             LOG_ERROR("DLSS-NR Vulkan pass: could not create the placeholder image");
             return false;
         }
 
         VkMemoryRequirements req {};
-        vkGetImageMemoryRequirements(_device, _dummyImage, &req);
+        vkGetImageMemoryRequirements(_device, image, &req);
 
         VkMemoryAllocateInfo alloc {};
         alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
@@ -153,25 +167,31 @@ bool DlssNr_Vk::CreateDummy(VkCommandBuffer cmdList)
         alloc.memoryTypeIndex =
             FindMemoryType(_physicalDevice, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
-        if (vkAllocateMemory(_device, &alloc, nullptr, &_dummyMemory) != VK_SUCCESS ||
-            vkBindImageMemory(_device, _dummyImage, _dummyMemory, 0) != VK_SUCCESS)
+        if (alloc.memoryTypeIndex == UINT32_MAX ||
+            vkAllocateMemory(_device, &alloc, nullptr, &memory) != VK_SUCCESS ||
+            vkBindImageMemory(_device, image, memory, 0) != VK_SUCCESS)
         {
             LOG_ERROR("DLSS-NR Vulkan pass: could not back the placeholder image");
+            discard();
             return false;
         }
 
         VkImageViewCreateInfo view {};
         view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        view.image = _dummyImage;
+        view.image = image;
         view.viewType = VK_IMAGE_VIEW_TYPE_2D;
         view.format = VK_FORMAT_R16G16B16A16_SFLOAT;
         view.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
-        if (vkCreateImageView(_device, &view, nullptr, &_dummyView) != VK_SUCCESS)
+        if (vkCreateImageView(_device, &view, nullptr, &imageView) != VK_SUCCESS)
         {
             LOG_ERROR("DLSS-NR Vulkan pass: could not view the placeholder image");
+            discard();
             return false;
         }
+        _dummyImage = image;
+        _dummyMemory = memory;
+        _dummyView = imageView;
     }
 
     // GENERAL satisfies both a sampled read and a storage write, so the placeholder can stand in for

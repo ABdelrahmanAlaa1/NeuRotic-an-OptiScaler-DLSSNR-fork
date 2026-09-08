@@ -16,6 +16,7 @@
 // vectors, so anything guessing from the parameter block alone attaches to both and runs the model twice
 // per rendered frame. Here it is a lookup on the feature handle.
 class Config;
+template<class Source> struct NrConfigSnapshot;
 
 namespace DlssNr
 {
@@ -33,14 +34,16 @@ namespace DlssNr
 // Experimental pre-SR path. NR runs on an OptiScaler-owned scratch texture and is copied back
 // into the game's ORIGINAL Color resource. NVSDK_NGX_Parameter_Color itself is never replaced.
 ID3D12Resource* EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,
-                                      ID3D12CommandQueue* timingQueue = nullptr);
+                                      ID3D12CommandQueue* timingQueue = nullptr,
+                                      const NrConfigSnapshot<Config>* settings = nullptr);
 
 // V10 preserves original final-SR jitter; RestoreAfterUpscale only restores the temporary Reset override.
 void RestoreAfterUpscale(NVSDK_NGX_Parameter* params);
 
 void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,
                           ID3D12CommandQueue* timingQueue = nullptr,
-                          bool forceAfterUpscale = false);
+                          bool forceAfterUpscale = false,
+                          const NrConfigSnapshot<Config>* settings = nullptr);
 
 
 
@@ -143,6 +146,10 @@ struct TelemetrySnapshot
     unsigned int guideHeight = 0;
 
     bool runBeforeSr = false;
+    bool enabled = false;
+    bool modelLoaded = false;
+    const char* failureReason = "";
+    bool retryAllowed = false;
     bool nativeRayReconstructionActive = false;
     // Pre-SR is only active after its private seed evaluation has succeeded and the first
     // displayable evaluation has completed. These fields intentionally separate the request

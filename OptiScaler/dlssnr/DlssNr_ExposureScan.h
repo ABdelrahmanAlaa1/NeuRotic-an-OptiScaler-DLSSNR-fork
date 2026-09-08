@@ -40,6 +40,7 @@ struct ID3D12Device;
 struct ID3D12Resource;
 struct ID3D12GraphicsCommandList;
 struct D3D12_UNORDERED_ACCESS_VIEW_DESC;
+struct D3D12_RESOURCE_DESC;
 
 namespace DlssNr
 {
@@ -81,7 +82,11 @@ unsigned int Examined();
 float BestValue(int* outIndex = nullptr, float* outLowest = nullptr, float* outHighest = nullptr);
 
 // Called once per frame from the Neural Rendering pass, on its command list. Copies one value out of
-// each candidate and reads back the copies taken a few frames ago.
+// each candidate once the readback slot's completion ticket permits reuse.
+// LIMITATION: discovery does not establish a source-state or foreign-heap ownership contract.
+// Tick still assumes UAV state; the tickets protect our readbacks, not the source heap or aliasing.
+// A resource AddRef does not establish that a placed resource's backing memory remains valid.
+// This optional scanner is not certified safe for arbitrary game resources.
 void Tick(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList);
 
 // What the scan has to say right now, in one line, for an indicator that can be read while playing.
@@ -96,7 +101,8 @@ enum class Verdict
 
 Verdict Where();
 
-// Fills a short line describing the state. Null-terminated, safe to draw every frame.
+// Fills a short line from one locked observation of the scan. The returned text is owned by the
+// calling thread and remains valid until that thread's next Headline() call.
 const char* Headline();
 
 // For the menu.

@@ -7214,8 +7214,10 @@ void MenuCommon::RenderMainMenuGraphs(RenderMenuContext& ctx)
                     ImGui::Separator();
                     ImGui::TextDisabled("Neural Rendering telemetry:");
                     ImGui::Text("Status: %s | Mode: %s | Reset pending: %s",
-                                nrTelemetry.failed ? "failed" : (nrTelemetry.running ? "running" : "idle"),
-                                nrTelemetry.runBeforeSr ? "Pre-SR" : "Post-SR",
+                                nrTelemetry.failed ? "failed" : (!nrTelemetry.enabled ? "off" :
+                                    (nrTelemetry.running ? "running" : "waiting")),
+                                nrTelemetry.nativeRayReconstructionActive ? "Post-RR" :
+                                    (nrTelemetry.runBeforeSr ? "Pre-SR requested" : "Post-SR requested"),
                                 nrTelemetry.resetPending ? "yes" : "no");
                     ImGui::Text("Frame %ux%u | Work %ux%u | Guides %ux%u",
                                 nrTelemetry.frameWidth, nrTelemetry.frameHeight,

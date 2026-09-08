@@ -7,144 +7,8 @@
 #include <optional>
 #include <filesystem>
 
-enum HasDefaultValue
-{
-    WithDefault,
-    NoDefault,
-    SoftDefault // Change always gets saved to the config
-};
-
-template <class T, HasDefaultValue defaultState = WithDefault> class CustomOptional : public std::optional<T>
-{
-  private:
-    T _defaultValue;
-    std::optional<T> _configIni;
-    bool _volatile;
-
-  public:
-    CustomOptional(T defaultValue)
-        requires(defaultState != NoDefault)
-        : std::optional<T>(), _defaultValue(std::move(defaultValue)), _configIni(std::nullopt), _volatile(false)
-    {
-    }
-
-    CustomOptional()
-        requires(defaultState == NoDefault)
-        : std::optional<T>(), _defaultValue(T {}), _configIni(std::nullopt), _volatile(false)
-    {
-    }
-
-    // Prevents a change from being saved to ini
-    constexpr void set_volatile_value(const T& value)
-    {
-        if (!_volatile)
-        { // make sure the previously set value is saved
-            if (this->has_value())
-                _configIni = this->value();
-            else
-                _configIni = std::nullopt;
-        }
-        _volatile = true;
-        std::optional<T>::operator=(value);
-    }
-
-    // Use this when first setting a CustomOptional
-    constexpr void set_from_config(const std::optional<T>& opt)
-    {
-        if (!this->has_value())
-        {
-            _configIni = opt;
-            std::optional<T>::operator=(opt);
-        }
-    }
-
-    constexpr CustomOptional& operator=(const T& value)
-    {
-        _volatile = false;
-        std::optional<T>::operator=(value);
-        return *this;
-    }
-
-    constexpr CustomOptional& operator=(T&& value)
-    {
-        _volatile = false;
-        std::optional<T>::operator=(std::move(value));
-        return *this;
-    }
-
-    constexpr CustomOptional& operator=(const std::optional<T>& opt)
-    {
-        _volatile = false;
-        std::optional<T>::operator=(opt);
-        return *this;
-    }
-
-    constexpr CustomOptional& operator=(std::optional<T>&& opt)
-    {
-        _volatile = false;
-        std::optional<T>::operator=(std::move(opt));
-        return *this;
-    }
-
-    // Needed for string literals for some reason
-    constexpr CustomOptional& operator=(const char* value)
-        requires std::same_as<T, std::string>
-    {
-        _volatile = false;
-        std::optional<T>::operator=(T(value));
-        return *this;
-    }
-
-    constexpr T value_or_default() const&
-        requires(defaultState != NoDefault)
-    {
-        return this->has_value() ? this->value() : _defaultValue;
-    }
-
-    constexpr T value_or_default() &&
-        requires(defaultState != NoDefault) {
-            return this->has_value() ? std::move(this->value()) : std::move(_defaultValue);
-        }
-
-        constexpr std::optional<T> value_for_config()
-            requires(defaultState == WithDefault)
-    {
-        if (_volatile)
-        {
-            if (_configIni != _defaultValue)
-                return _configIni;
-
-            return std::nullopt;
-        }
-
-        if (!this->has_value() || *this == _defaultValue)
-            return std::nullopt;
-
-        return this->value();
-    }
-
-    constexpr std::optional<T> value_for_config()
-        requires(defaultState != WithDefault)
-    {
-        if (_volatile)
-            return _configIni;
-
-        if (this->has_value())
-            return this->value();
-
-        return std::nullopt;
-    }
-
-    constexpr T value_for_config_or(T other)
-    {
-        auto option = value_for_config();
-
-        if (option.has_value())
-            return option.value();
-        else
-            return other;
-    }
-};
+#include "NrConfigState.h"
+#include "NrConfigSnapshot.h"
 
 constexpr inline int UnboundKey = -1;
 constexpr uint32_t NV_PRESET_LATEST = 0x00FFFFFF;
@@ -225,11 +89,7 @@ enum class LowLatencyMode : uint32_t
 class Config
 {
   public:
-    struct DlssNrRuntimeSnapshot
-    {
-        bool enabled = false;
-        uint64_t resumeGeneration = 0;
-    };
+    using DlssNrRuntimeSnapshot = NrConfigState::RuntimeSnapshot;
 
     Config();
 
@@ -263,58 +123,62 @@ class Config
     // --- DLSS 5 Neural Rendering (OptiScaler/dlssnr) --- removable as one block -----------------
     // DLSS Neural Rendering: a detail-synthesis pass over the upscaler's output. Off by default -- it is
     // an undocumented feature driven directly through its snippet, not something NVIDIA exposes.
-    CustomOptional<bool> DlssNrEnabled { false };
-    // Runtime readers execute on rendering and hook threads. Keep them off CustomOptional, whose
-    // std::optional storage is intentionally not atomic, and publish the enable bit together with
+    NrOptional<bool> DlssNrEnabled { false };
+    // Runtime readers execute on rendering and hook threads. Publish the enable bit together with
     // an off->on generation so a resumed model cannot reuse temporal history across skipped frames.
     void SetDlssNrEnabled(bool enabled);
     DlssNrRuntimeSnapshot GetDlssNrRuntimeSnapshot() const noexcept;
-    CustomOptional<bool> DlssNrRunBeforeSr { false }; // experimental: run NR before DLSS SR
+    // All routing writers must use this transaction; separate field assignments can tear the pair.
+    void SetDlssNrRenderingMode(int32_t mode);
+    // Capture once per evaluation and reuse for creation, tuning checks, and built-tuning records.
+    // Returned option copies require no locks. No NR lock survives this call.
+    NrConfigSnapshot<Config> GetDlssNrConfigSnapshot() const;
+    NrOptional<bool> DlssNrRunBeforeSr { false }; // experimental: run NR before DLSS SR
     // 0 = Quality (post-SR), 1 = Performance (pre-SR).
     // Keep the legacy boolean as the routing compatibility surface for existing callers/configurations.
-    CustomOptional<int32_t> DlssNrRenderingMode { 1 };
-    CustomOptional<bool> DlssNrPreDlaa { false }; // v10: private native-resolution DLAA resolve before NR, then re-jitter before SR
+    NrOptional<int32_t> DlssNrRenderingMode { 1 };
+    NrOptional<bool> DlssNrPreDlaa { false }; // v10: private native-resolution DLAA resolve before NR, then re-jitter before SR
     // Toggles the pass in game. Unbound by default -- a key that does something unexpected is worse
     // than one that does nothing.
-    CustomOptional<int> DlssNrToggleKey { UnboundKey };
-    CustomOptional<uint32_t> DlssNrPreset { 0 };
-    CustomOptional<float> DlssNrIntensity { 1.0f };
+    NrOptional<int> DlssNrToggleKey { UnboundKey };
+    NrOptional<uint32_t> DlssNrPreset { 0 };
+    NrOptional<float> DlssNrIntensity { 1.0f };
     // 0 default (standard), 1 natural, 2 cinematic -- the model's own processing profiles.
-    CustomOptional<uint32_t> DlssNrStyle { 0 };
-    CustomOptional<float> DlssNrLocalStructure { 1.0f };
-    CustomOptional<float> DlssNrLocalTone { 1.0f };
+    NrOptional<uint32_t> DlssNrStyle { 0 };
+    NrOptional<float> DlssNrLocalStructure { 1.0f };
+    NrOptional<float> DlssNrLocalTone { 1.0f };
     // -1 means follow local structure, which is the model's own default. It is not a strength of zero.
-    CustomOptional<float> DlssNrSkinStructure { -1.0f };
-    CustomOptional<bool> DlssNrAutoMask { true };
+    NrOptional<float> DlssNrSkinStructure { -1.0f };
+    NrOptional<bool> DlssNrAutoMask { true };
 
     // How much of the model's edit reaches the frame. Separated because detail synthesis is a luminance
     // edit and any colour shift is usually the part you do not want, and allowed past 1.0 because
     // exaggerating an edit is the only honest way to see whether there is one.
-    CustomOptional<float> DlssNrTransferStrength { 1.0f };
-    CustomOptional<float> DlssNrColourStrength { 1.0f };
+    NrOptional<float> DlssNrTransferStrength { 1.0f };
+    NrOptional<float> DlssNrColourStrength { 1.0f };
 
     // The RenoDX reversible proxy mode. 0 = today's soft-knee encode + our composition (default,
     // byte-identical); 1 = unclipped Neutwo proxy + our composition; 2 = Neutwo proxy + pure-inverse
     // replace. An in-game A/B and a way back. Default 0 = byte-identical to before.
-    CustomOptional<uint32_t> DlssNrReversibleMode { 0 };
+    NrOptional<uint32_t> DlssNrReversibleMode { 0 };
 
     // Whether the model's edit is applied. Off keeps the pass running (so Hold frame works) but shows
     // the clean upscaler frame -- for A/B'ing NR on/off on a frozen frame. Default true.
-    CustomOptional<bool> DlssNrApplyModel { true };
+    NrOptional<bool> DlssNrApplyModel { true };
 
     // Frame hold: freeze the NR pass's input so a live setting change re-renders the SAME frame -- the
     // only clean way to A/B our settings. A live testing toggle, not really a saved preference; off by
     // default. See dlssnr/design/frame-hold.md.
-    CustomOptional<bool> DlssNrHoldFrame { false };
+    NrOptional<bool> DlssNrHoldFrame { false };
 
 
     // The most the pass may multiply or divide a pixel by. A detail pass has no business restyling a
     // light source, whatever the model returns.
-    CustomOptional<float> DlssNrMaxRatio { 2.0f };
+    NrOptional<float> DlssNrMaxRatio { 2.0f };
 
     // How a model that worked below the frame's size is brought back. 0 classic, 1 matched
     // residual. Only has an effect when Model resolution is under 100%.
-    CustomOptional<uint32_t> DlssNrTransfer { 1 };
+    NrOptional<uint32_t> DlssNrTransfer { 1 };
 
     // Measure the white point from the frame instead of taking it from the slider. On a frame the
     // game already tone mapped there is nothing to measure and this has no effect.
@@ -331,7 +195,7 @@ class Config
 
     // Take the white point from the game's own exposure texture instead of measuring or guessing.
     // Off by default until it has been seen to work in more than one game.
-    CustomOptional<bool> DlssNrWhitePointFromExposure { true };
+    NrOptional<bool> DlssNrWhitePointFromExposure { true };
 
     // Ask the model, once, whether it will run on Direct3D 11 without the bridge.
     //
@@ -339,10 +203,10 @@ class Config
     // this one initialises an NVIDIA subsystem on the game's live D3D11 device, in a process where the
     // D3D12 NGX instance is already running. It should return an error code and nothing more, but
     // "should" is doing work in that sentence and it ships into games nobody can test first.
-    CustomOptional<bool> DlssNrProbeD3D11 { false };
+    NrOptional<bool> DlssNrProbeD3D11 { false };
 
     // 0 off, 1 the picture the model was shown, 2 its raw answer, 3 what it changed, amplified.
-    CustomOptional<uint32_t> DlssNrDebugView { 0 };
+    NrOptional<uint32_t> DlssNrDebugView { 0 };
 
     // Showing the pass against itself, without having to toggle it and remember what the last frame
     // looked like. 0 off, 1 side by side, 2 a wipe.
@@ -350,31 +214,31 @@ class Config
     // Side by side squeezes the whole frame into each half, so it is a comparison rather than
     // something to play in. The wipe cuts one frame and resamples nothing, so it is; the split is a
     // stored setting and stays where it was put once the menu closes.
-    CustomOptional<uint32_t> DlssNrCompare { 0 };
-    CustomOptional<float> DlssNrCompareSplit { 0.5f };
+    NrOptional<uint32_t> DlssNrCompare { 0 };
+    NrOptional<float> DlssNrCompareSplit { 0.5f };
 
     // Side by side only. 1 fits the whole frame at its right shape and accepts the bars; 2 fills
     // the half and crops the sides off instead.
-    CustomOptional<float> DlssNrCompareZoom { 1.0f };
+    NrOptional<float> DlssNrCompareZoom { 1.0f };
 
     // Which side the edited frame sits on, in both comparison modes.
-    CustomOptional<bool> DlssNrCompareSwap { false };
+    NrOptional<bool> DlssNrCompareSwap { false };
 
     // Labels drawn onto the two sides of a comparison, so a screenshot still says which is which.
     // Drawn into the frame's own plane with a clip per side: in the wipe they are revealed and hidden
     // by the split exactly as the images are, and there is nothing to drag.
-    CustomOptional<bool> DlssNrCompareTags { false };
-    CustomOptional<float> DlssNrTagScale { 1.5f };
+    NrOptional<bool> DlssNrCompareTags { false };
+    NrOptional<float> DlssNrTagScale { 1.5f };
 
     // The fraction of the frame's resolution the model works at. The frame itself is never reduced --
     // only the model's contribution is computed small and enlarged, so the picture underneath is
     // untouched whatever this is set to. 1.0 is full resolution and behaves exactly as before.
-    CustomOptional<float> DlssNrWorkingScale { 1.0f };
+    NrOptional<float> DlssNrWorkingScale { 1.0f };
 
     // Filter used for NR supersampling (working scale > 1): the model runs above native, and this is
     // the downscaler that averages its answer back to native. Independent of OutputScalingDownscaler
     // so NR and Output Scaling can run different filters at once. Lanczos3 is the sharp default.
-    CustomOptional<Scaler> DlssNrScalingDownscaler { Scaler::Lanczos3 };
+    NrOptional<Scaler> DlssNrScalingDownscaler { Scaler::Lanczos3 };
 
     // Ask the driver's own nvngx.dll whether it will dispatch Neural Rendering, once per session.
     //
@@ -385,7 +249,7 @@ class Config
     // signature question disappears, and users stop needing a 165 MB copy in every game folder.
     //
     // Off by default: it is a diagnostic, not a feature.
-    CustomOptional<bool> DlssNrProxyProbe { false };
+    NrOptional<bool> DlssNrProxyProbe { false };
 
     // Run Neural Rendering through the driver's own nvngx.dll rather than through the forwarder.
     //
@@ -396,7 +260,7 @@ class Config
     // and OptiScaler folders into Init_Ext.
     //
     // Off until it is shown to produce the same picture. If it does, the forwarder can go.
-    CustomOptional<bool> DlssNrUseProxy { false };
+    NrOptional<bool> DlssNrUseProxy { false };
 
     // Look for the exposure the game computed but never handed to the upscaler.
     //
@@ -408,7 +272,7 @@ class Config
     //
     // It decides nothing either way. It watches and it reports, because the last two times a number
     // was inferred here it went straight into the interface and was wrong.
-    CustomOptional<bool> DlssNrScanExposure { false };
+    NrOptional<bool> DlssNrScanExposure { false };
 
     // Anchoring the scan: the white point that looked right, and the scan's value at that moment.
     //
@@ -436,17 +300,17 @@ class Config
     // was a button the notice never mentioned -- and then by clearing, which silently undid a
     // setting the user had made. Both were attempts to stop an illegal state being REACHED. A single
     // choice cannot reach it: there is nothing to keep consistent, because there is only one value.
-    CustomOptional<uint32_t> DlssNrWhitePointSource { 1 };
+    NrOptional<uint32_t> DlssNrWhitePointSource { 1 };
 
-    CustomOptional<bool> DlssNrScanMeter { false };
+    NrOptional<bool> DlssNrScanMeter { false };
 
-    CustomOptional<float> DlssNrScanAnchorValue { 0.0f };       // legacy single anchor, migrated then unused
-    CustomOptional<float> DlssNrScanAnchorWhitePoint { 0.0f };  // legacy single anchor, migrated then unused
+    NrOptional<float> DlssNrScanAnchorValue { 0.0f };       // legacy single anchor, migrated then unused
+    NrOptional<float> DlssNrScanAnchorWhitePoint { 0.0f };  // legacy single anchor, migrated then unused
 
     // The multi-point anchor table, serialised as "scan:white;scan:white;..." ascending. See
     // dlssnr/design/multi-point-anchoring.md. Replaces the single pair above; a pre-existing single
     // anchor is migrated into a one-row table on first load.
-    CustomOptional<std::string> DlssNrScanAnchors { std::string() };
+    NrOptional<std::string> DlssNrScanAnchors { std::string() };
 
     // Whether the scan's number rises or falls with the light.
     //
@@ -454,7 +318,7 @@ class Config
     // DOWN as the scene gets brighter -- but some store its reciprocal, and nothing in the buffer
     // says which. Rather than guess and be silently wrong in half the games, this is one click: if
     // the picture moves the wrong way, flip it.
-    CustomOptional<bool> DlssNrScanInverted { false };
+    NrOptional<bool> DlssNrScanInverted { false };
 
 
 
@@ -472,14 +336,14 @@ class Config
     //
     // 1.0 is the identity: take the game's exposure exactly as given. That is the "safe value", and
     // it is safe by construction rather than by being written down somewhere.
-    CustomOptional<float> DlssNrWhitePointTrim { 1.0f };
+    NrOptional<float> DlssNrWhitePointTrim { 1.0f };
 
     // The scan's trim, kept apart from the exposure texture's.
     //
     // They are trims on different things and a value found against one is meaningless against the
     // other. Sharing one slider meant switching source silently carried a number across, so a
     // picture that had been tuned came back wrong for a reason nothing on screen explained.
-    CustomOptional<float> DlssNrScanTrim { 1.0f };
+    NrOptional<float> DlssNrScanTrim { 1.0f };
 
     // How many times to run the model over the same frame, each pass fed the previous one's answer.
     //
@@ -491,7 +355,7 @@ class Config
     // The cost is exactly linear -- the model is 98% of the frame's expense and every pass pays it
     // again -- so 8 costs eight times, near enough. There is no shortcut and no amortisation: the
     // passes are sequential and each one needs the last one's output.
-    CustomOptional<uint32_t> DlssNrPasses { 1 };
+    NrOptional<uint32_t> DlssNrPasses { 1 };
 
     // Which depth convention the model is told the guide uses.
     //
@@ -501,7 +365,7 @@ class Config
     //
     // Writes one set of matched before/after frames per session, without anyone having to ask. The
     // folder is cleared at the start of each run, so it holds one session's worth and never grows.
-    CustomOptional<bool> DlssNrAutoCapture { true };
+    NrOptional<bool> DlssNrAutoCapture { true };
 
 
 
@@ -509,7 +373,7 @@ class Config
 
     // Multiplies the (auto or manual) white point before the encode: what the model considers "white".
     // Higher means highlights sit lower on the curve and the model treats them as less extreme.
-    CustomOptional<float> DlssNrWhitePointScale { 1.0f };
+    NrOptional<float> DlssNrWhitePointScale { 1.0f };
 
 
 
@@ -934,8 +798,7 @@ class Config
     inline static Config* _config;
     inline static std::vector<std::string> _log;
 
-    void PublishDlssNrEnabled(bool enabled) noexcept;
-    std::atomic<uint64_t> _dlssNrRuntimeState { 0 };
+    NrConfigState _dlssNrState;
 
     std::filesystem::path absoluteFileName;
     std::wstring fileName = L"OptiScaler.ini";

@@ -31,6 +31,9 @@
 
 #include <d3d12.h>
 
+class Config;
+template<class Source> struct NrConfigSnapshot;
+
 namespace DlssNr
 {
 namespace Proxy
@@ -44,7 +47,7 @@ unsigned int Run(ID3D12GraphicsCommandList* cmdList, ID3D12Device* device, ID3D1
                  ID3D12Resource* depth, ID3D12Resource* motion, ID3D12Resource* output,
                  unsigned int width, unsigned int height, unsigned int guideWidth,
                  unsigned int guideHeight, bool depthInverted, bool reset, float mvScaleX,
-                 float mvScaleY);
+                 float mvScaleY, float jitterX, float jitterY, const NrConfigSnapshot<Config>& cfg);
 
 // Retires the feature and its parameter block without freeing pending GPU references.
 void Release();

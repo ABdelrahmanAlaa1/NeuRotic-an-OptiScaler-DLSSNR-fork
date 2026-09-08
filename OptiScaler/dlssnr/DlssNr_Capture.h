@@ -59,7 +59,7 @@ class FrameCapture
     void record(ID3D12GraphicsCommandList* cmd, ID3D12Device* device, ID3D12Resource* before,
                 D3D12_RESOURCE_STATES beforeState, ID3D12Resource* after, D3D12_RESOURCE_STATES afterState)
     {
-        if (!active_ || before == nullptr || after == nullptr)
+        if (!active_ || cmd == nullptr || device == nullptr || before == nullptr || after == nullptr)
             return;
 
         // Recording stops the moment the run is complete, and does not resume until write() has
@@ -78,6 +78,11 @@ class FrameCapture
             ready_ = true;
             return;
         }
+
+        // Resizing can temporarily supply an unsupported surface. Keep the request armed
+        // without allocating or copying; the next supported pair starts the new batch.
+        if (!supportedShape(before->GetDesc()) || !supportedShape(after->GetDesc()))
+            return;
 
         if (!ensure(device, before, after))
         {
@@ -178,6 +183,13 @@ class FrameCapture
 
   private:
     bool shapeChanged_ = false;
+    static bool supportedShape(const D3D12_RESOURCE_DESC& desc)
+    {
+        return desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.Width != 0 &&
+               desc.Height != 0 && desc.DepthOrArraySize == 1 && desc.MipLevels == 1 &&
+               desc.SampleDesc.Count == 1;
+    }
+
     static bool sameShape(D3D12_RESOURCE_DESC actual, const D3D12_RESOURCE_DESC& expected)
     {
         return actual.Dimension == expected.Dimension && actual.Width == expected.Width &&
@@ -189,13 +201,6 @@ class FrameCapture
     {
         if (!beforeShots_.empty())
             return true;
-
-        for (auto* source : {before, after})
-        {
-            const auto d = source->GetDesc();
-            if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.DepthOrArraySize != 1 ||
-                d.MipLevels != 1 || d.SampleDesc.Count != 1) return false;
-        }
 
         beforeShots_.resize(wanted_);
         afterShots_.resize(wanted_);

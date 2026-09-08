@@ -118,7 +118,7 @@ void CollectRetired(bool shutdown = false)
 // These have to be set before create, not at evaluate. The model reads its tuning once, while
 // building the feature; values written only at evaluate are ignored, which is why several of these
 // controls appeared to do nothing for a long time.
-void SetCreationParameters(NVSDK_NGX_Parameter* params, const Config& cfg, unsigned int width,
+void SetCreationParameters(NVSDK_NGX_Parameter* params, const NrConfigSnapshot<Config>& cfg, unsigned int width,
                            unsigned int height)
 {
     SetUInt(params, "DLSSNR.Enabled", 1u);
@@ -180,15 +180,13 @@ unsigned int Run(ID3D12GraphicsCommandList* cmdList, ID3D12Device* device, ID3D1
                  ID3D12Resource* depth, ID3D12Resource* motion, ID3D12Resource* output,
                  unsigned int width, unsigned int height, unsigned int guideWidth,
                  unsigned int guideHeight, bool depthInverted, bool reset, float mvScaleX,
-                 float mvScaleY)
+                 float mvScaleY, float jitterX, float jitterY, const NrConfigSnapshot<Config>& cfg)
 {
     CollectRetired();
     if (g_retired.size() >= 32 || !GpuSafety::Record(cmdList))
         return 0;
     if (g_proxy.failed || !Available())
         return 0;
-
-    const Config& cfg = *Config::Instance();
 
     if (g_proxy.feature != nullptr && (g_proxy.width != width || g_proxy.height != height))
         Release();
@@ -311,6 +309,8 @@ unsigned int Run(ID3D12GraphicsCommandList* cmdList, ID3D12Device* device, ID3D1
     // telling the model that almost nothing had moved.
     SetFloat(params, "DLSSNR.MVecScaleX", mvScaleX);
     SetFloat(params, "DLSSNR.MVecScaleY", mvScaleY);
+    SetFloat(params, "Jitter.Offset.X", jitterX);
+    SetFloat(params, "Jitter.Offset.Y", jitterY);
 
     SetFloat(params, "DLSSNR.Intensity", cfg.DlssNrIntensity.value_or_default());
     SetUInt(params, "DLSSNR.Style", (unsigned int) cfg.DlssNrStyle.value_or_default());

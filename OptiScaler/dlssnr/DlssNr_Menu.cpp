@@ -56,7 +56,7 @@ static void HelpMarker(const char* tip)
 // live under the cursor; only the commit that triggers the rebuild waits for release. Cheap controls
 // that are just shader constants (detail, colour, paper white) do not use this -- they can afford to
 // apply live.
-static bool DeferredSlider(const char* label, CustomOptional<float>* opt, float mn, float mx,
+static bool DeferredSlider(const char* label, NrOptional<float>* opt, float mn, float mx,
                            float def, const char* fmt = "%.2f")
 {
     static std::unordered_map<std::string, float> pending;
@@ -108,8 +108,7 @@ void RenderMenu(Config* config, float menuResScale)
         int renderMode = std::clamp(config->DlssNrRenderingMode.value_or_default(), 0, 1);
         if (ImGui::Combo("Rendering mode", &renderMode, renderModeNames, IM_ARRAYSIZE(renderModeNames)))
         {
-            config->DlssNrRenderingMode = renderMode;
-            config->DlssNrRunBeforeSr = renderMode != 0;
+            config->SetDlssNrRenderingMode(renderMode);
             LOG_INFO("DLSS-NR rendering mode applied: {} (Super Resolution placement only; native RR remains RR -> NR)",
                      renderModeNames[renderMode]);
         }
@@ -134,9 +133,23 @@ void RenderMenu(Config* config, float menuResScale)
         // The setting requests Pre-SR. It is deliberately not described as active until the
         // replacement-resource, reset, seed, and display-ready checks have all passed.
         const auto nrTelemetry = DlssNr::Telemetry();
-        if (nrTelemetry.nativeRayReconstructionActive)
+        const bool vulkan = DlssNr::IsRunningVk();
+        if (!enabled)
         {
-            ImGui::TextDisabled("Ray Reconstruction active: native RR upscale, then NR.");
+            ImGui::TextDisabled("Rendering mode selected: %s.", renderModeNames[renderMode]);
+        }
+        else if (nrTelemetry.failed)
+        {
+            ImGui::TextDisabled("Rendering mode requested: %s; NR is unavailable.", renderModeNames[renderMode]);
+        }
+        else if (vulkan)
+        {
+            ImGui::TextDisabled("Native Vulkan NR active after the upscaler.");
+        }
+        else if (nrTelemetry.nativeRayReconstructionActive)
+        {
+            ImGui::TextDisabled(nrTelemetry.running ? "Ray Reconstruction active: native RR upscale, then NR."
+                                                  : "Ray Reconstruction active: waiting for NR after native RR.");
         }
         else if (renderMode != 0)
         {
@@ -150,7 +163,8 @@ void RenderMenu(Config* config, float menuResScale)
         }
         else
         {
-            ImGui::TextDisabled("Quality active: Post-SR after native DLSS upscale.");
+            ImGui::TextDisabled(nrTelemetry.running ? "Quality active: Post-SR after native DLSS upscale."
+                                                  : "Quality requested: waiting for a successful Post-SR evaluation.");
         }
 
         bool applyModel = config->DlssNrApplyModel.value_or_default();
@@ -162,33 +176,31 @@ void RenderMenu(Config* config, float menuResScale)
                        "\nframe and toggle this to see the same frozen frame with and without Neural"
                        "\nRendering. Leave it on for normal use.");
 
-        // Either backend. The two keep separate state, and on a native Vulkan game the D3D12 side
-        // is never touched -- so asking only that one reports "waiting for the upscaler" over a pass
-        // that is demonstrably running.
-        const bool vulkan = DlssNr::IsRunningVk();
-
-        // Turning the pass off does not release the model, so the feature handle stays alive and
-        // IsRunning keeps answering yes. Reporting a cost from that was wrong in the way that matters
-        // most: the toggle is how anyone A/Bs this, so the one moment the number is read is the one
-        // moment it describes the frame before last.
+        // Report the same locked D3D12 observation used above. A loaded model can be retained
+        // while NR is disabled; its previous frame's cost must not imply current activity.
         if (!enabled)
         {
-            ImGui::TextDisabled("Off. The model stays loaded, so turning this back on is immediate.");
+            ImGui::TextDisabled("Off. Any loaded model is retained for the next enable request.");
         }
-        else if (!DlssNr::IsRunning() && !vulkan)
+        else if (!nrTelemetry.running && !vulkan)
         {
-            const char* reason = DlssNr::FailureReason();
+            const char* reason = nrTelemetry.failureReason;
+            const char* vkReason = DlssNr::FailureReasonVk();
+            if (reason[0] == 0)
+                reason = vkReason;
 
             if (reason[0] != 0)
             {
                 ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.35f, 1.0f), "Off for this session: %s.", reason);
-                ImGui::SameLine();
-
-                if (ImGui::SmallButton("Retry"))
-                    DlssNr::RetryAfterFailure();
+                if (nrTelemetry.retryAllowed && vkReason[0] == 0)
+                {
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Retry"))
+                        DlssNr::RetryAfterFailure();
+                }
             }
             else if (enabled)
-                ImGui::TextUnformatted("Waiting for the upscaler to run.");
+                ImGui::TextUnformatted("Waiting for a successful NR evaluation on the requested path.");
         }
         else
         {
@@ -197,7 +209,7 @@ void RenderMenu(Config* config, float menuResScale)
             // nothing in it to hang this off.
             // Either backend's timer. They measure the same thing by different means, and only one
             // of them is running.
-            const auto ms = vulkan ? DlssNr::LastGpuTimeVk() : DlssNr::LastGpuTime();
+            const auto ms = vulkan ? DlssNr::LastGpuTimeVk() : nrTelemetry.totalGpuMs;
 
             // With "Apply the model" off the pass STILL RUNS (so Hold-frame A/B can toggle its edit on
             // a frozen frame) -- it only outputs the clean frame. So the cost is real, and saying so

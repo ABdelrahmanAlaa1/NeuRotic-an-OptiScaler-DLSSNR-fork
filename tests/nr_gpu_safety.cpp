@@ -3,6 +3,7 @@
 #include "../OptiScaler/dlssnr/NrGpuSafety.cpp"
 #include "../OptiScaler/dlssnr/DlssNr_Capture.h"
 #include <dxgi1_4.h>
+#include <d3d12sdklayers.h>
 #include <cassert>
 #include <cstdio>
 
@@ -12,6 +13,10 @@ static void Check(HRESULT hr) { assert(SUCCEEDED(hr)); }
 
 int main()
 {
+    ComPtr<ID3D12Debug> debug;
+    const bool debugEnabled = SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)));
+    if (debugEnabled) debug->EnableDebugLayer();
+    std::puts(debugEnabled ? "D3D12 debug layer enabled." : "D3D12 debug layer unavailable; API validation omitted.");
     ComPtr<IDXGIFactory4> factory;
     ComPtr<IDXGIAdapter> warp;
     ComPtr<ID3D12Device> device;
@@ -111,14 +116,15 @@ int main()
 
     // Capture must not copy a new shape into an old footprint or free an unsubmitted copy.
     Check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&list)));
-    auto makeTexture = [&](UINT width)
+    auto makeTexture = [&](UINT width, UINT height = 4,
+                           DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM, UINT16 mips = 1)
     {
         ComPtr<ID3D12Resource> texture;
         D3D12_HEAP_PROPERTIES heap {}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC desc {};
         desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        desc.Width = width; desc.Height = 4; desc.DepthOrArraySize = 1; desc.MipLevels = 1;
-        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; desc.SampleDesc.Count = 1;
+        desc.Width = width; desc.Height = height; desc.DepthOrArraySize = 1; desc.MipLevels = mips;
+        desc.Format = format; desc.SampleDesc.Count = 1;
         desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         Check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&texture)));
@@ -138,8 +144,97 @@ int main()
     assert(capture.readyToWrite());
     assert(capture.write("unused-capture-test-path").empty());
     assert(capture.isActive() && capture.progress() == 0); // rearmed, no files written
+
+    // A temporary unsupported replacement must not silently cancel the rearmed request.
+    auto mipTexture = makeTexture(8, 4, DXGI_FORMAT_R8G8B8A8_UNORM, 2);
+    capture.record(list.Get(), device.Get(), largeTexture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   mipTexture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    assert(capture.isActive() && capture.progress() == 0 && !capture.readyToWrite());
+    capture.record(nullptr, device.Get(), largeTexture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   largeTexture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    capture.record(list.Get(), nullptr, largeTexture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   largeTexture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    assert(capture.isActive() && capture.progress() == 0);
+    capture.record(list.Get(), device.Get(), largeTexture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   largeTexture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    assert(capture.progress() == 1);
+    Check(list->Close());
+    Check(list->Reset(allocator.Get(), nullptr));
+    capture.release();
+
+    // Exercise both inputs and each copy-relevant resize independently. The original test
+    // canceled its list: these copies are actually submitted behind a GPU gate.
+    auto tallTexture = makeTexture(4, 8);
+    auto floatTexture = makeTexture(4, 4, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    UINT64 captureGate = 6;
+    for (auto* replacement : {largeTexture.Get(), tallTexture.Get(), floatTexture.Get(), mipTexture.Get()})
+    {
+        for (bool changeBefore : {false, true})
+        {
+            capture.request(2);
+            capture.record(list.Get(), device.Get(), smallTexture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                           smallTexture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            assert(capture.progress() == 1);
+            Check(list->Close());
+            Check(queue->Wait(gate.Get(), captureGate));
+            submit(queue.Get());
+            Check(list->Reset(nextAllocator.Get(), nullptr));
+            capture.record(list.Get(), device.Get(), changeBefore ? replacement : smallTexture.Get(),
+                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                           changeBefore ? smallTexture.Get() : replacement,
+                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            for (int poll = 0; poll < 100; ++poll)
+                assert(capture.progress() == 1 && !capture.readyToWrite());
+            Check(gate->Signal(captureGate++));
+            assert(Safety::Drain(5000));
+            assert(capture.readyToWrite());
+            assert(capture.write("unused-capture-test-path").empty());
+            assert(capture.isActive() && capture.progress() == 0);
+            capture.release();
+            Check(list->Close());
+            Check(list->Reset(allocator.Get(), nullptr));
+        }
+    }
+
+    // A completed but replayable capture still owns all shots. Saturating the requested
+    // bound must neither overrun the vectors nor start a new size while waiting.
+    capture.request(capture::kMaxFrames + 10);
+    for (unsigned int i = 0; i < capture::kMaxFrames + 10; ++i)
+        capture.record(list.Get(), device.Get(), smallTexture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                       smallTexture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    assert(capture.progress() == capture::kMaxFrames);
+    Check(list->Close());
+    submit(queue.Get());
+    assert(Safety::Drain(5000) && !capture.readyToWrite());
+    Check(queue->Wait(gate.Get(), captureGate));
+    submit(queue.Get());
+    Check(list->Reset(nextAllocator.Get(), nullptr));
+    capture.record(list.Get(), device.Get(), largeTexture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   largeTexture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    assert(capture.progress() == capture::kMaxFrames && !capture.readyToWrite());
+    Check(gate->Signal(captureGate));
+    assert(Safety::Drain(5000) && capture.readyToWrite());
     capture.release();
     list.Reset();
+
+    if (debugEnabled)
+    {
+        ComPtr<ID3D12InfoQueue> messages;
+        Check(device.As(&messages));
+        for (UINT64 i = 0; i < messages->GetNumStoredMessages(); ++i)
+        {
+            SIZE_T bytes = 0;
+            Check(messages->GetMessage(i, nullptr, &bytes));
+            std::vector<unsigned char> storage(bytes);
+            auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+            Check(messages->GetMessage(i, message, &bytes));
+            if (message->Severity <= D3D12_MESSAGE_SEVERITY_ERROR)
+            {
+                std::fprintf(stderr, "D3D12 error: %s\n", message->pDescription);
+                assert(false);
+            }
+        }
+    }
 
     // Fence failure is a permanent failure, never mistaken for permission to reclaim.
     auto failed = std::make_shared<Safety::Recording>();

@@ -46,32 +46,24 @@ Config::Config()
     Reload(absoluteFileName);
 }
 
-void Config::PublishDlssNrEnabled(bool enabled) noexcept
-{
-    uint64_t current = _dlssNrRuntimeState.load(std::memory_order_acquire);
-
-    for (;;)
-    {
-        if ((current & 1u) == static_cast<uint64_t>(enabled))
-            return;
-
-        const uint64_t next = enabled ? ((((current >> 1u) + 1u) << 1u) | 1u) : (current & ~uint64_t { 1u });
-        if (_dlssNrRuntimeState.compare_exchange_weak(current, next, std::memory_order_acq_rel,
-                                                      std::memory_order_acquire))
-            return;
-    }
-}
-
 void Config::SetDlssNrEnabled(bool enabled)
 {
-    DlssNrEnabled = enabled;
-    PublishDlssNrEnabled(enabled);
+    _dlssNrState.SetEnabled(DlssNrEnabled, enabled);
 }
 
 Config::DlssNrRuntimeSnapshot Config::GetDlssNrRuntimeSnapshot() const noexcept
 {
-    const uint64_t state = _dlssNrRuntimeState.load(std::memory_order_acquire);
-    return { (state & 1u) != 0, state >> 1u };
+    return _dlssNrState.Snapshot();
+}
+
+void Config::SetDlssNrRenderingMode(int32_t mode)
+{
+    NrConfigState::SetRoutingMode(DlssNrRenderingMode, DlssNrRunBeforeSr, mode);
+}
+
+NrConfigSnapshot<Config> Config::GetDlssNrConfigSnapshot() const
+{
+    return NrConfigSnapshot<Config>(*this);
 }
 
 bool Config::Reload(std::filesystem::path iniPath)
@@ -344,8 +336,10 @@ bool Config::Reload(std::filesystem::path iniPath)
             DLSSEnabled.set_from_config(readBool("DLSS", "Enabled"));
 
             // --- DLSS 5 Neural Rendering (OptiScaler/dlssnr) ---
-            DlssNrEnabled.set_from_config(readBool("DlssNr", "Enabled"));
-            PublishDlssNrEnabled(DlssNrEnabled.value_or_default());
+            {
+            // Config-only transaction: no GPU or scanner calls while holding this mutex.
+            NrConfigSynchronization::Guard nrLock(NrConfigSynchronization::Mutex());
+            _dlssNrState.LoadEnabled(DlssNrEnabled, readBool("DlssNr", "Enabled"));
             // PerformanceMode is the user-facing name. Keep accepting the older experimental
             // key so profiles created before Alpha 0.4 retain their selected render path.
             auto performanceMode = readBool("DlssNr", "PerformanceMode");
@@ -361,8 +355,7 @@ bool Config::Reload(std::filesystem::path iniPath)
             // explicit legacy PerformanceMode/RunBeforeSR selection until the user selects a mode.
             else
                 renderingMode = 1;
-            DlssNrRenderingMode.set_from_config(renderingMode);
-            DlssNrRunBeforeSr.set_from_config(renderingMode.value() != 0);
+            NrConfigState::LoadRoutingMode(DlssNrRenderingMode, DlssNrRunBeforeSr, renderingMode.value());
             DlssNrPreDlaa.set_from_config(readBool("DlssNr", "PreDlaa"));
             DlssNrToggleKey.set_from_config(readInt("DlssNr", "ToggleKey"));
             DlssNrTransferStrength.set_from_config(readFloat("DlssNr", "TransferStrength"));
@@ -415,6 +408,7 @@ bool Config::Reload(std::filesystem::path iniPath)
             DlssNrReversibleMode.set_from_config(readUInt("DlssNr", "ReversibleMode"));
             DlssNrApplyModel.set_from_config(readBool("DlssNr", "ApplyModel"));
             DlssNrHoldFrame.set_from_config(readBool("DlssNr", "HoldFrame"));
+            }
             UseGenericAppIdWithDlss.set_from_config(readBool("DLSS", "UseGenericAppIdWithDlss"));
 
             RenderPresetOverride.set_from_config(readBool("DLSS", "RenderPresetOverride"));
@@ -1244,6 +1238,10 @@ bool Config::SaveIni()
         ini.SetValue("DLSS", "Enabled", GetBoolValue(Instance()->DLSSEnabled.value_for_config()).c_str());
 
     // --- DLSS 5 Neural Rendering (OptiScaler/dlssnr) ---
+    {
+    // Serialize the already-owned anchor string below. Never call ExposureScan::SerializeAnchors
+    // inside this transaction: scanner code may read NR config while holding its own mutex.
+    NrConfigSynchronization::Guard nrLock(NrConfigSynchronization::Mutex());
     ini.SetValue("DlssNr", "Enabled", GetBoolValue(Instance()->DlssNrEnabled.value_for_config()).c_str());
     // Persist the user-facing key and retain the legacy spelling for prior Alpha builds.
     const int renderingMode = std::clamp(Instance()->DlssNrRenderingMode.value_or_default(), 0, 1);
@@ -1280,7 +1278,7 @@ bool Config::SaveIni()
     ini.SetValue("DlssNr", "TagScale",
                  GetFloatValue(Instance()->DlssNrTagScale.value_for_config()).c_str());
     ini.SetValue("DlssNr", "WorkingScale", GetFloatValue(Instance()->DlssNrWorkingScale.value_for_config()).c_str());
-    ini.SetValue("DlssNr", "ScalingDownscaler", GetIntValue(Instance()->DlssNrScalingDownscaler).c_str());
+    ini.SetValue("DlssNr", "ScalingDownscaler", GetIntValue(Instance()->DlssNrScalingDownscaler.snapshot()).c_str());
     ini.SetValue("DlssNr", "AutoCapture", GetBoolValue(Instance()->DlssNrAutoCapture.value_for_config()).c_str());
 
     // These were read every launch but never written, so nothing set through the menu survived a
@@ -1313,6 +1311,7 @@ bool Config::SaveIni()
     ini.SetValue("DlssNr", "ReversibleMode", GetIntValue(Instance()->DlssNrReversibleMode.value_for_config()).c_str());
     ini.SetValue("DlssNr", "ApplyModel", GetBoolValue(Instance()->DlssNrApplyModel.value_for_config()).c_str());
     ini.SetValue("DlssNr", "HoldFrame", GetBoolValue(Instance()->DlssNrHoldFrame.value_for_config()).c_str());
+    }
         ini.SetValue("DLSS", "RenderPresetOverride",
                      GetBoolValue(Instance()->RenderPresetOverride.value_for_config()).c_str());
         ini.SetValue("DLSS", "RenderPresetForAll",
