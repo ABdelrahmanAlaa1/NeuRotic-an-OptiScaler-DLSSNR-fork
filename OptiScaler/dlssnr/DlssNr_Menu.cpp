@@ -110,12 +110,13 @@ void RenderMenu(Config* config, float menuResScale)
         {
             config->DlssNrRenderingMode = renderMode;
             config->DlssNrRunBeforeSr = renderMode != 0;
-            LOG_INFO("DLSS-NR rendering mode applied: {} ({})", renderModeNames[renderMode],
-                     renderMode == 0 ? "RR -> DLSS SR -> NR" : "RR -> NR -> DLSS SR");
+            LOG_INFO("DLSS-NR rendering mode applied: {} (Super Resolution placement only; native RR remains RR -> NR)",
+                     renderModeNames[renderMode]);
         }
 
         HelpMarker("Quality keeps NR after native DLSS Super Resolution. Performance runs NR before "
-                   "native DLSS Super Resolution.");
+                   "native DLSS Super Resolution. Ray Reconstruction already denoises and reconstructs "
+                   "to the final output in one mode-aware pass, so NR remains after RR in both modes.");
 
         bool enabled = config->DlssNrEnabled.value_or_default();
         if (ImGui::Checkbox("Enable Neural Rendering", &enabled))
@@ -133,7 +134,11 @@ void RenderMenu(Config* config, float menuResScale)
         // The setting requests Pre-SR. It is deliberately not described as active until the
         // replacement-resource, reset, seed, and display-ready checks have all passed.
         const auto nrTelemetry = DlssNr::Telemetry();
-        if (renderMode != 0)
+        if (nrTelemetry.nativeRayReconstructionActive)
+        {
+            ImGui::TextDisabled("Ray Reconstruction active: native RR upscale, then NR.");
+        }
+        else if (renderMode != 0)
         {
             if (nrTelemetry.preSrDisplayReady)
                 ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1.0f),
