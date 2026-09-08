@@ -297,6 +297,34 @@ void RenderMenu(Config* config, float menuResScale)
                        "\n\nFrom hhkbble's multi-pass work on this fork.");
         }
 
+        static const char* nrPresetNames[] = { "Default", "Preset 1", "Preset 2", "Preset 3" };
+        int preset = (int) config->DlssNrPreset.value_or_default();
+        if (ImGui::Combo("Model preset", &preset, nrPresetNames, IM_ARRAYSIZE(nrPresetNames)))
+            config->DlssNrPreset = (uint32_t) preset;
+
+        HelpMarker("Default leaves the choice to the model."
+                       "\n\nNot the same scale as the super resolution or ray reconstruction presets --"
+                       "\nthe same number means something different here.");
+
+        static const char* nrStyleNames[] = { "Default (standard)", "Natural", "Cinematic" };
+        int style = (int) config->DlssNrStyle.value_or_default();
+
+        if (style > 2)
+            style = 2;
+
+        if (ImGui::Combo("Style", &style, nrStyleNames, IM_ARRAYSIZE(nrStyleNames)))
+            config->DlssNrStyle = (uint32_t) style;
+
+        HelpMarker("The model's own processing profiles."
+                   "\n\nDefault (standard): the strongest. Boosts local contrast and deepens"
+                   "\nlighting, and can oversaturate or look stylised -- most of what reads as"
+                   "\n'the model changed my game's look' is this profile."
+                   "\n\nNatural: the same detail work with a gentler hand. Keeps skin tones and"
+                   "\ntonal balance closer to what the game rendered."
+                   "\n\nCinematic: tones down the shine and over-processing for a film-like look."
+                   "\n\nRead when the model is built, so a change rebuilds it after a moment. The"
+                   "\nnames come from community testing; NVIDIA ships no names in the binaries.");
+
         ImGui::SeparatorText("How much of it lands");
 
         float transfer = config->DlssNrTransferStrength.value_or_default();
@@ -370,37 +398,13 @@ void RenderMenu(Config* config, float menuResScale)
                        "\nstable. If you love the Replace look but the flicker bothers you, use this."
                        "\n\nOff is byte-identical to before.");
 
-        ImGui::SeparatorText("Model");
+        ImGui::Spacing();
+        if (auto ch = ScopedCollapsingHeader("Model##DlssNrModelSection"); ch.IsHeaderOpen())
+        {
+        ScopedIndent indent {};
+        ImGui::Spacing();
 
         ImGui::TextUnformatted("Read when the model is built, so a change rebuilds it after a moment.");
-
-        static const char* nrPresetNames[] = { "Default", "Preset 1", "Preset 2", "Preset 3" };
-        int preset = (int) config->DlssNrPreset.value_or_default();
-        if (ImGui::Combo("Model preset", &preset, nrPresetNames, IM_ARRAYSIZE(nrPresetNames)))
-            config->DlssNrPreset = (uint32_t) preset;
-
-        HelpMarker("Default leaves the choice to the model."
-                       "\n\nNot the same scale as the super resolution or ray reconstruction presets --"
-                       "\nthe same number means something different here.");
-
-        static const char* nrStyleNames[] = { "Default (standard)", "Natural", "Cinematic" };
-        int style = (int) config->DlssNrStyle.value_or_default();
-
-        if (style > 2)
-            style = 2;
-
-        if (ImGui::Combo("Style", &style, nrStyleNames, IM_ARRAYSIZE(nrStyleNames)))
-            config->DlssNrStyle = (uint32_t) style;
-
-        HelpMarker("The model's own processing profiles."
-                   "\n\nDefault (standard): the strongest. Boosts local contrast and deepens"
-                   "\nlighting, and can oversaturate or look stylised -- most of what reads as"
-                   "\n'the model changed my game's look' is this profile."
-                   "\n\nNatural: the same detail work with a gentler hand. Keeps skin tones and"
-                   "\ntonal balance closer to what the game rendered."
-                   "\n\nCinematic: tones down the shine and over-processing for a film-like look."
-                   "\n\nRead when the model is built, so a change rebuilds it after a moment. The"
-                   "\nnames come from community testing; NVIDIA ships no names in the binaries.");
 
         DeferredSlider("Intensity", &config->DlssNrIntensity, 0.0f, 2.0f, 1.0f);
 
@@ -422,8 +426,13 @@ void RenderMenu(Config* config, float menuResScale)
             config->DlssNrAutoMask = autoMask;
 
         HelpMarker("Lets the model find skin itself rather than treating the frame uniformly.");
+        }
 
-        ImGui::SeparatorText("Colour");
+        ImGui::Spacing();
+        if (auto ch = ScopedCollapsingHeader("Colour##DlssNrColourSection"); ch.IsHeaderOpen())
+        {
+        ScopedIndent indent {};
+        ImGui::Spacing();
 
         ImGui::TextDisabled("The model was trained on finished, sRGB-encoded frames. The upscaler's\n"
                             "output is not one: it is linear and open-ended. These decide how it is\n"
@@ -989,8 +998,13 @@ void RenderMenu(Config* config, float menuResScale)
 
 
         }
+        }
 
-        ImGui::SeparatorText("Compare");
+        ImGui::Spacing();
+        if (auto ch = ScopedCollapsingHeader("Compare##DlssNrCompareSection"); ch.IsHeaderOpen())
+        {
+        ScopedIndent indent {};
+        ImGui::Spacing();
 
         // Freeze the frame the model works on, so a setting change re-renders it in place -- the only
         // clean way to A/B our own settings (a moving scene confounds every other comparison). See
@@ -1088,6 +1102,7 @@ void RenderMenu(Config* config, float menuResScale)
                        "\nis wrong and nothing downstream can be judged."
                        "\n\nDifference shows what the model actually changed, amplified twenty times and"
                        "\ncentred on grey. A flat grey frame there means it is doing nothing.");
+        }
 
         ImGui::PopItemWidth();
     }
