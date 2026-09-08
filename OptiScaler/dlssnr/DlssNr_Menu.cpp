@@ -19,6 +19,19 @@
 namespace DlssNr
 {
 
+// Nested panels indent their contents on the left. Match that inset on the right so wrapped
+// descriptions remain visually inside the panel instead of running to the parent column edge.
+class ScopedNestedTextWrap
+{
+  public:
+    explicit ScopedNestedTextWrap(float rightInset = 16.0f)
+    {
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - rightInset);
+    }
+
+    ~ScopedNestedTextWrap() { ImGui::PopTextWrapPos(); }
+};
+
 // The "(?)" marker every control carries, matching the rest of the menu.
 static void HelpMarker(const char* tip)
 {
@@ -404,6 +417,7 @@ void RenderMenu(Config* config, float menuResScale)
         {
         ScopedIndent indent {};
         ImGui::Spacing();
+        ScopedNestedTextWrap nestedWrap {};
 
         ImGui::TextUnformatted("Read when the model is built, so a change rebuilds it after a moment.");
 
@@ -434,6 +448,7 @@ void RenderMenu(Config* config, float menuResScale)
         {
         ScopedIndent indent {};
         ImGui::Spacing();
+        ScopedNestedTextWrap nestedWrap {};
 
         ImGui::TextDisabled("The model was trained on finished, sRGB-encoded frames. The upscaler's\n"
                             "output is not one: it is linear and open-ended. These decide how it is\n"
@@ -1006,6 +1021,7 @@ void RenderMenu(Config* config, float menuResScale)
         {
         ScopedIndent indent {};
         ImGui::Spacing();
+        ScopedNestedTextWrap nestedWrap {};
 
         // Freeze the frame the model works on, so a setting change re-renders it in place -- the only
         // clean way to A/B our own settings (a moving scene confounds every other comparison). See
