@@ -27,8 +27,10 @@
 
 // Bounded descriptor/constant capacity, not a frame-age safety guarantee. Each dispatch reserves
 // a slot until its recording is reset/destroyed AND all observed GPU executions have completed.
-// If the pool is busy, the entry point bypasses NR before recording output transitions.
-#define DLSSNR_NUM_OF_HEAPS 48
+// GTA V Enhanced retains completed command lists for roughly 0.63 seconds before Reset. Its
+// three-pass full-resolution path needs about 96 live slots at 51 evaluations/s; 128 preserves
+// the eight-slot admission margin without weakening replay or GPU-completion safety.
+#define DLSSNR_NUM_OF_HEAPS 128
 
 class Config;
 template<class Source> struct NrConfigSnapshot;
