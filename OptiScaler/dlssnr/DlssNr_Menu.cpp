@@ -145,15 +145,17 @@ void RenderMenu(Config* config, float menuResScale)
                    "\nDirect3D 11/Vulkan bridges; native Vulkan keeps the post-upscale path.");
 
         bool deferredDlss = config->DlssNrDeferredDlss.value_or_default();
-        int precisionChoice = config->DlssNrPrecision.value_or_default() == 2 ? 1 : 0;
-        const char* precisions[] = { "FP8 (NVIDIA DLL)", "attempt at NVFP4 hybrid" };
+        int precisionChoice = config->DlssNrPrecision.value_or_default() == 4 ? 2 : config->DlssNrPrecision.value_or_default() == 2 ? 1 : 0;
+        const char* precisions[] = { "FP8 (NVIDIA DLL)", "NVFP4 hybrid (previous)", "NVFP4 hybrid (recommended)" };
         if (ImGui::Combo("Model precision", &precisionChoice, precisions, IM_ARRAYSIZE(precisions)))
-            config->DlssNrPrecision = precisionChoice == 1 ? 2u : 0u;
+            config->DlssNrPrecision = precisionChoice == 2 ? 4u : precisionChoice == 1 ? 2u : 0u;
         if (precisionChoice == 1)
             HelpMarker("VERY minor improvements on Blackwell.");
+        else if (precisionChoice == 2)
+            HelpMarker("Recommended hybrid for Blackwell. Small rounding differences occur at 1440p input. Previous hybrid remains available for comparison.");
         const auto hybridStatus = DlssNrNative::Status();
         if (hybridStatus.rfind("Restart required:", 0) == 0 ||
-            (precisionChoice == 1 && hybridStatus.find("fallback") != std::string::npos))
+            (precisionChoice > 0 && hybridStatus.find("fallback") != std::string::npos))
             ImGui::TextWrapped("%s", hybridStatus.c_str());
         if (ImGui::Checkbox("Generate before SR, apply after SR (DLSS)", &deferredDlss))
             config->DlssNrDeferredDlss = deferredDlss;
