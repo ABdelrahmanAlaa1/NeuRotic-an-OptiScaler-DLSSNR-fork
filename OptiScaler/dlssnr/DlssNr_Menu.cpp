@@ -85,13 +85,13 @@ static bool DeferredSlider(const char* label, Option* opt, float mn, float mx,
     }
 
     if (std::strcmp(label, "Intensity") == 0)
-        HelpMarker("Overall strength requested from the model. 1 = default; results depend on the selected profile.");
+        HelpMarker("Overall enhancement strength for this pass. 1 = default; results depend on the profile.\nValues above 1 are experimental; the runtime may clamp or ignore them.");
     else if (std::strcmp(label, "Local structure") == 0)
-        HelpMarker("Amount of local detail requested from the model. 1 = default.");
+        HelpMarker("Fine detail and local contrast requested from the model (high-frequency structure).\n1 = default; values above 1 are experimental.");
     else if (std::strcmp(label, "Local tone") == 0)
-        HelpMarker("Amount of local brightness and contrast adjustment requested from the model.");
+        HelpMarker("Broad brightness and lighting changes requested from the model (low-frequency tone).\nLater passes default to 0. Values above 1 are experimental.");
     else if (std::strcmp(label, "Skin structure") == 0)
-        HelpMarker("Skin detail requested from the model. -1 follows Local structure; 0 reduces skin detail. Skin colour is controlled separately.");
+        HelpMarker("Fine detail for pixels the model identifies as skin. -1 follows Local structure; 0 reduces skin detail.\nSkin colour is controlled separately. Values above 1 are experimental.");
     return changed;
 }
 
@@ -130,7 +130,7 @@ void RenderMenu(Config* config, float menuResScale)
         if (ImGui::Checkbox("Enable Neural Rendering", &enabled))
             config->DlssNrEnabled = enabled;
 
-        HelpMarker("Enable the NR model. Requires nvngx_dlssnr.dll plus the included nvngx.dll_dlssnr.dll helper.");
+        HelpMarker("Enhance lighting and material appearance with the NR model. Placement selects before or after upscaling.\nRequires nvngx_dlssnr.dll plus the included nvngx.dll_dlssnr.dll helper.");
 
         bool beforeSr = config->DlssNrRunBeforeSr.value_or_default();
         const bool deferredActive = config->DlssNrDeferredDlss.value_or_default();
@@ -148,7 +148,7 @@ void RenderMenu(Config* config, float menuResScale)
         const char* precisions[] = { "NVIDIA (FP8)", "Experimental (FP8+NVFP4 hybrid)" };
         if (ImGui::Combo("Model precision", &precisionChoice, precisions, IM_ARRAYSIZE(precisions)))
             config->DlssNrPrecision = precisionChoice == 1 ? 4u : 0u;
-        HelpMarker("NVIDIA: original FP8 model (default). Experimental: FP8+NVFP4 hybrid for RTX 50 GPUs; output may differ slightly.");
+        HelpMarker("NVIDIA: original FP8 model (default), with some sensitive operations kept at higher precision.\nExperimental: this fork's FP8+NVFP4 hybrid for RTX 50 GPUs; output may differ slightly.");
         const auto hybridStatus = DlssNrNative::Status();
         if (hybridStatus.rfind("Restart required:", 0) == 0 ||
             (precisionChoice > 0 && hybridStatus.find("fallback") != std::string::npos))
@@ -392,7 +392,7 @@ void RenderMenu(Config* config, float menuResScale)
             int style = (int) std::min(config->DlssNrStyle.value_or_default(), 2u);
             if (ImGui::Combo("Style", &style, styles, IM_ARRAYSIZE(styles)))
                 config->DlssNrStyle = (uint32_t) style;
-            HelpMarker("Select the NR model profile: Standard, Natural or Cinematic.");
+            HelpMarker("Select the appearance profile: Standard, Natural or Cinematic. Intensity controls its strength.");
             DeferredSlider("Intensity", &config->DlssNrIntensity, 0.0f, 2.0f, 1.0f);
             DeferredSlider("Local structure", &config->DlssNrLocalStructure, 0.0f, 2.0f, 1.0f);
             DeferredSlider("Local tone", &config->DlssNrLocalTone, 0.0f, 2.0f, 1.0f);
@@ -400,7 +400,7 @@ void RenderMenu(Config* config, float menuResScale)
             bool mask = config->DlssNrAutoMask.value_or_default();
             if (ImGui::Checkbox("Auto skin mask", &mask))
                 config->DlssNrAutoMask = mask;
-            HelpMarker("Use the model's automatic skin selection. Accuracy varies; it is separate from the colour-based mask below.");
+            HelpMarker("Use the model's learned skin selection to apply Skin structure without an authored mask.\nAccuracy varies. This is separate from the colour-based mask below.");
             ImGui::TreePop();
         }
 
