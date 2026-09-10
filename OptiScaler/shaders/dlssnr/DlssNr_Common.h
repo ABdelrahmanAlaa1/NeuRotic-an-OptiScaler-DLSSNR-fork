@@ -27,7 +27,11 @@ enum DlssNrMode : uint32_t
     DlssNrMode_NormalizeMotion = 8, // current-to-previous motion in normalized image coordinates
     DlssNrMode_ComposeMotion = 9, // compose two successive fields at the displaced coordinate
     DlssNrMode_ApplyInterpolatedResidual = 10, // t4: R8_UNORM NVIDIA suppression flag
-    DlssNrMode_ZeroMotion = 11 // private reset-only NR/SR guide, never passed to residual FG
+    DlssNrMode_ZeroMotion = 11, // private reset-only NR/SR guide, never passed to residual FG
+    DlssNrMode_DilateMotion = 12, // 3x3 depth-based foreground MV dilation + camera jitter compensation
+    DlssNrMode_ControlMask = 13, // depth disocclusion + fast motion whip-pan reactive control mask
+    DlssNrMode_RrDecompose = 14, // pre-RR tone extraction (Solution A) or pre-multiplier (Solution B)
+    DlssNrMode_RrInject = 15 // post-RR composite injection of high-frequency structure delta
 };
 
 // A successful sample may be reused only on the immediately following frame.
@@ -142,6 +146,11 @@ struct DlssNrFrameInfo
     // DLSS output extent, independent of the NR injection point or working scale.
     unsigned int OutputWidth = 0;
     unsigned int OutputHeight = 0;
+
+    // Subpixel camera jitter offset reported by NGX parameters
+    float JitterOffsetX = 0.0f;
+    float JitterOffsetY = 0.0f;
+    bool HasJitter = false;
 };
 
 struct alignas(256) DlssNrConstants
@@ -233,6 +242,13 @@ struct alignas(256) DlssNrConstants
     float SkinColour;
     float EnvironmentDetail;
     float EnvironmentColour;
+
+    float JitterDeltaX;
+    float JitterDeltaY;
+    float RrStructureBoost;
+    uint32_t RrMode;
+    uint32_t MotionAdaptiveGuard;
+    float MotionClampingThreshold;
 };
 
 class DlssNr_Common
@@ -272,6 +288,7 @@ class DlssNr_Common
 
     // Despite the name, this is the automatic *skin* mask, not an interface mask.
     static constexpr const char* kAutoMask = "DLSSNR.UseAutoMask";
+    static constexpr const char* kControlMask = "DLSSNR.ControlMask";
 
     // Defaults to -1, meaning follow local structure. It is not a 0..1 strength and -1 is not "off".
     static constexpr const char* kSkinStructure = "DLSSNR.SkinStructureStrength";

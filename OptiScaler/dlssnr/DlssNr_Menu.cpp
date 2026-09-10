@@ -179,6 +179,52 @@ void RenderMenu(Config* config, float menuResScale)
 
         HelpMarker("Show or hide the NR effect. The model still runs when hidden.\nDisable Enable Neural Rendering to stop its GPU cost.");
 
+        ImGui::SeparatorText("Motion & Anti-Ghosting Suite");
+        bool dilateMv = config->DlssNrDilateMotionVectors.value_or_default();
+        if (ImGui::Checkbox("Dilate motion vectors (3x3 depth foreground)", &dilateMv))
+            config->DlssNrDilateMotionVectors = dilateMv;
+        HelpMarker("Expands foreground motion vectors across object silhouettes using depth and velocity coherence.\nFixes edge ghosting, halos and thin geometry smearing. Live toggle.");
+
+        bool compJitter = config->DlssNrCompensateJitter.value_or_default();
+        if (ImGui::Checkbox("Compensate camera jitter", &compJitter))
+            config->DlssNrCompensateJitter = compJitter;
+        HelpMarker("Removes subpixel camera jitter delta from motion vectors so reprojection stays in exact phase with the frame.\nEliminates high-frequency jitter shimmer and motion blur. Live toggle.");
+
+        bool genMask = config->DlssNrGenerateControlMask.value_or_default();
+        if (ImGui::Checkbox("Generate disocclusion control mask", &genMask))
+            config->DlssNrGenerateControlMask = genMask;
+        HelpMarker("Detects depth disocclusions and camera whip-pan velocity spikes, signaling DLSSNR to flush temporal history on revealed pixels.\nEliminates disocclusion streaks and fast-turn ghost trails. Live toggle.");
+
+        bool motionGuard = config->DlssNrMotionAdaptiveGuard.value_or_default();
+        if (ImGui::Checkbox("Motion-adaptive ghost guard", &motionGuard))
+            config->DlssNrMotionAdaptiveGuard = motionGuard;
+        HelpMarker("Dynamically tightens the luminance ratio guard and color neighborhood bounding on moving pixels.\nPrevents neural ratio over-brightening and halo trails behind moving objects. Live toggle.");
+
+        ImGui::SeparatorText("Ray Reconstruction (RR) Material Preservation");
+        bool rrSolA = config->DlssNrRrSolutionA.value_or_default();
+        if (ImGui::Checkbox("Solution A: Hybrid Pre-Tone + Post-Structure Injection", &rrSolA))
+        {
+            config->DlssNrRrSolutionA = rrSolA;
+            if (rrSolA) config->DlssNrRrSolutionB = false;
+        }
+        HelpMarker("Runs NR before RR to inject low-frequency tone that survives RR denoising, then composites high-frequency material/SSR/AO structure after RR.\nFixes material detail and reflections getting filtered out by Ray Reconstruction. Refresh upscaler or menu apply.");
+
+        bool rrSolB = config->DlssNrRrSolutionB.value_or_default();
+        if (ImGui::Checkbox("Solution B: Pre-RR Structure Multiplier", &rrSolB))
+        {
+            config->DlssNrRrSolutionB = rrSolB;
+            if (rrSolB) config->DlssNrRrSolutionA = false;
+        }
+        HelpMarker("Amplifies high-frequency material delta before RR evaluate so it punches through RR's noise rejection threshold.\nAlternative approach to preserve reflections and micro-AO. Refresh upscaler or menu apply.");
+
+        if (rrSolA || rrSolB)
+        {
+            float boost = config->DlssNrRrStructureBoost.value_or_default();
+            if (ImGui::SliderFloat("RR Structure Boost", &boost, 0.0f, 5.0f, "%.2fx"))
+                config->DlssNrRrStructureBoost = boost;
+            HelpMarker("Multiplier for high-frequency structure, specular glints, SSR and micro-AO detail in Ray Reconstruction.\nDefault: 1.50x. Live toggle.");
+        }
+
         // Either backend. The two keep separate state, and on a native Vulkan game the D3D12 side
         // is never touched -- so asking only that one reports "waiting for the upscaler" over a pass
         // that is demonstrably running.

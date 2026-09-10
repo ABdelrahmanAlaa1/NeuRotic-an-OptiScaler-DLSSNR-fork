@@ -169,6 +169,7 @@ using PFN_NrSetExtras = void(__cdecl*) (void*, float, ID3D12Resource*, ID3D12Res
                                         unsigned int, unsigned int, unsigned int, unsigned int);
 using PFN_NrSetFloatSlot = void(__cdecl*) (int);
 using PFN_NrProbeFloat = void(__cdecl*) (void*, const char*, float, int);
+using PFN_NrSetControlMask = void(__cdecl*) (void*, ID3D12Resource*);
 
 // One per back buffer, so an allocator is never reset while its frame is still in flight.
 
@@ -376,6 +377,23 @@ struct NrState
     bool builtAutoMask = false;
     unsigned long long settledAt = 0;
 
+    // Motion & Anti-Ghosting resources
+    PFN_NrSetControlMask setControlMask = nullptr;
+    ID3D12Resource* dilatedMotion = nullptr;
+    ID3D12Resource* controlMaskScratch = nullptr;
+    ID3D12Resource* prevDepth = nullptr;
+    bool hasPrevDepth = false;
+
+    // Subpixel Camera Jitter tracking
+    float prevJitterX = 0.0f;
+    float prevJitterY = 0.0f;
+    bool hasPrevJitter = false;
+
+    // RR Material Preservation resources & state
+    ID3D12Resource* rrStructureScratch = nullptr;
+    ID3D12Resource* preEnhancedScratch = nullptr;
+    bool rrStructureValid = false;
+
     // Once something fails there is no recovering it mid-session, and retrying every frame turns a
     // failure into a crash. It stays off and says why.
     bool failed = false;
@@ -545,6 +563,7 @@ bool EnsureForwarder()
     g_nr.lastInit = (int*) GetProcAddress(g_nr.forwarder, "dlssnr_call_last_init");
     g_nr.lastCreate = (int*) GetProcAddress(g_nr.forwarder, "dlssnr_call_last_create");
     g_nr.lastModelError = (const char*(*)()) GetProcAddress(g_nr.forwarder, "dlssnr_call_error");
+    g_nr.setControlMask = (PFN_NrSetControlMask) GetProcAddress(g_nr.forwarder, "dlssnr_call_set_control_mask");
 
     if (g_nr.create == nullptr || g_nr.evaluate == nullptr)
     {
@@ -1633,6 +1652,43 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     const bool targetSupportsUav =
         cropColor || (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
 
+    // Ray Reconstruction Post-Injection (Solution A):
+    // If we cached the high-frequency structure delta from pre-RR, composite it directly
+    // onto the post-RR output and return early without re-evaluating the denoiser model.
+    if (frame.RayReconstruction && !frame.BeforeUpscale &&
+        cfg.DlssNrRrSolutionA.value_or_default() && g_nr.rrStructureValid &&
+        g_nr.rrStructureScratch != nullptr)
+    {
+        if (g_nr.preEnhancedScratch == nullptr)
+            g_nr.preEnhancedScratch = CreateScratch(device, desc.Format, width, height);
+
+        if (g_nr.preEnhancedScratch != nullptr)
+        {
+            DlssNrConstants injectParams {};
+            injectParams.Mode = DlssNrMode_RrInject;
+            injectParams.Width = width;
+            injectParams.Height = height;
+            injectParams.RrStructureBoost = cfg.DlssNrRrStructureBoost.value_or_default();
+
+            TransitionTarget(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+            DispatchPass(cmdList, injectParams, g_nr.rrStructureScratch, nullptr, target,
+                         nullptr, nullptr, g_nr.preEnhancedScratch, nullptr);
+
+            Barrier(cmdList, g_nr.preEnhancedScratch, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE);
+            TransitionTarget(D3D12_RESOURCE_STATE_COPY_DEST);
+            cmdList->CopyResource(target, g_nr.preEnhancedScratch);
+            TransitionTarget(outputArrival);
+            Barrier(cmdList, g_nr.preEnhancedScratch, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+            g_nr.rrStructureValid = false;
+            device->Release();
+            return;
+        }
+    }
+
     const auto guideDesc = depth->GetDesc();
     const auto motionDesc = motion->GetDesc();
     const auto guides = DlssNr::ResolveGuideRegions(
@@ -1794,6 +1850,14 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             ParkNrResource(g_nr.colorSmall);
             ParkNrResource(g_nr.outputNative);
             ParkNrResource(g_nr.activeColor);
+            ParkNrResource(g_nr.dilatedMotion);
+            ParkNrResource(g_nr.controlMaskScratch);
+            ParkNrResource(g_nr.prevDepth);
+            g_nr.hasPrevDepth = false;
+            g_nr.hasPrevJitter = false;
+            ParkNrResource(g_nr.rrStructureScratch);
+            ParkNrResource(g_nr.preEnhancedScratch);
+            g_nr.rrStructureValid = false;
             g_nr.passScratchFailed = false;
         }
     }
@@ -2423,6 +2487,107 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
 
     SetExtras(cfg, nullptr, nullptr, 0, 0, 0, 0);
 
+    float jitterDeltaX = 0.0f;
+    float jitterDeltaY = 0.0f;
+    if (cfg.DlssNrCompensateJitter.value_or_default() && frame.HasJitter)
+    {
+        if (g_nr.hasPrevJitter && !g_nr.reset)
+        {
+            jitterDeltaX = frame.JitterOffsetX - g_nr.prevJitterX;
+            jitterDeltaY = frame.JitterOffsetY - g_nr.prevJitterY;
+        }
+        g_nr.prevJitterX = frame.JitterOffsetX;
+        g_nr.prevJitterY = frame.JitterOffsetY;
+        g_nr.hasPrevJitter = true;
+    }
+    else
+    {
+        g_nr.hasPrevJitter = false;
+    }
+
+    ID3D12Resource* activeMotion = motionIn;
+    const bool dilateEnabled = cfg.DlssNrDilateMotionVectors.value_or_default();
+    const bool jitterEnabled = cfg.DlssNrCompensateJitter.value_or_default() && (jitterDeltaX != 0.0f || jitterDeltaY != 0.0f);
+
+    if (dilateEnabled || jitterEnabled)
+    {
+        if (g_nr.dilatedMotion == nullptr)
+        {
+            DXGI_FORMAT motionFmt = TypedGuideFormat(motionDesc.Format);
+            if (motionFmt == DXGI_FORMAT_UNKNOWN || IsTypeless(motionFmt))
+                motionFmt = DXGI_FORMAT_R16G16_FLOAT;
+            g_nr.dilatedMotion = CreateScratch(device, motionFmt, motionWidth, motionHeight);
+        }
+
+        if (g_nr.dilatedMotion != nullptr)
+        {
+            DlssNrConstants dilateParams {};
+            dilateParams.Mode = DlssNrMode_DilateMotion;
+            dilateParams.Width = motionWidth;
+            dilateParams.Height = motionHeight;
+            dilateParams.GuideWidth = guideWidth;
+            dilateParams.GuideHeight = guideHeight;
+            dilateParams.Passthrough = g_nr.guideDepthInverted ? 1u : 0u;
+            dilateParams.JitterDeltaX = jitterDeltaX;
+            dilateParams.JitterDeltaY = jitterDeltaY;
+            dilateParams.MotionClampingThreshold = dilateEnabled ? 1.0f : 0.0f;
+
+            DispatchPass(cmdList, dilateParams, motionIn, depthIn, nullptr, nullptr, nullptr,
+                         g_nr.dilatedMotion, nullptr);
+
+            Barrier(cmdList, g_nr.dilatedMotion, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+            activeMotion = g_nr.dilatedMotion;
+        }
+    }
+
+    if (cfg.DlssNrGenerateControlMask.value_or_default())
+    {
+        if (g_nr.controlMaskScratch == nullptr)
+            g_nr.controlMaskScratch = CreateScratch(device, DXGI_FORMAT_R8G8B8A8_UNORM, guideWidth, guideHeight);
+
+        if (g_nr.prevDepth == nullptr)
+        {
+            DXGI_FORMAT depthFmt = TypedGuideFormat(guideDesc.Format);
+            if (depthFmt == DXGI_FORMAT_UNKNOWN || IsTypeless(depthFmt))
+                depthFmt = DXGI_FORMAT_R32_FLOAT;
+            g_nr.prevDepth = CreateScratch(device, depthFmt, guideWidth, guideHeight);
+            g_nr.hasPrevDepth = false;
+        }
+
+        if (g_nr.controlMaskScratch != nullptr && g_nr.prevDepth != nullptr)
+        {
+            DlssNrConstants maskParams {};
+            maskParams.Mode = DlssNrMode_ControlMask;
+            maskParams.Width = guideWidth;
+            maskParams.Height = guideHeight;
+            maskParams.GuideWidth = guideWidth;
+            maskParams.GuideHeight = guideHeight;
+            maskParams.MvScaleX = g_nr.guideMvScaleX;
+            maskParams.MvScaleY = g_nr.guideMvScaleY;
+            maskParams.MotionClampingThreshold = 25.0f;
+
+            ID3D12Resource* historyDepth = g_nr.hasPrevDepth ? g_nr.prevDepth : depthIn;
+
+            DispatchPass(cmdList, maskParams, depthIn, historyDepth, nullptr, activeMotion, nullptr,
+                         g_nr.controlMaskScratch, nullptr);
+
+            Barrier(cmdList, g_nr.controlMaskScratch, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+            if (g_nr.setControlMask != nullptr)
+                g_nr.setControlMask(g_nr.capabilityParams, g_nr.controlMaskScratch);
+
+            Barrier(cmdList, g_nr.prevDepth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_COPY_DEST);
+            cmdList->CopyResource(g_nr.prevDepth, depthIn);
+            Barrier(cmdList, g_nr.prevDepth, D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            g_nr.hasPrevDepth = true;
+        }
+    }
+
     // The proxy path, when asked for. Same inputs, same model -- the difference is who calls it.
     //
     // Nothing falls back automatically. A silent fallback would mean never finding out the proxy
@@ -2431,7 +2596,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     if (cfg.DlssNrUseProxy.value_or_default())
     {
         const unsigned int proxyResult = DlssNr::Proxy::Run(
-            cmdList, device, modelInput, depthIn, motionIn, g_nr.output, workWidth, workHeight,
+            cmdList, device, modelInput, depthIn, activeMotion, g_nr.output, workWidth, workHeight,
             guideWidth, guideHeight, motionWidth, motionHeight, depthBaseX, depthBaseY,
             motionBaseX, motionBaseY, g_nr.guideDepthInverted, g_nr.reset,
             g_nr.guideMvScaleX * mvToWorkX, g_nr.guideMvScaleY * mvToWorkY);
@@ -2523,7 +2688,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
 
         MakeModelWritable(passOutput);
         result = g_nr.evaluate(
-            cmdList, passFeature, g_nr.capabilityParams, passInput, depthIn, motionIn, passOutput,
+            cmdList, passFeature, g_nr.capabilityParams, passInput, depthIn, activeMotion, passOutput,
             workWidth, workHeight, guideWidth, guideHeight, motionWidth, motionHeight,
             depthBaseX, depthBaseY, motionBaseX, motionBaseY, g_nr.guideDepthInverted ? 1 : 0,
             passReset ? 1 : 0, tuning.intensity,
@@ -2645,6 +2810,8 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         resolveParams.CompareSplit = cfg.DlssNrCompareSplit.value_or_default();
         resolveParams.CompareZoom = std::max(1.0f, cfg.DlssNrCompareZoom.value_or_default());
         resolveParams.CompareSwap = cfg.DlssNrCompareSwap.value_or_default() ? 1u : 0u;
+        resolveParams.MotionAdaptiveGuard = cfg.DlssNrMotionAdaptiveGuard.value_or_default() ? 1u : 0u;
+        resolveParams.MotionClampingThreshold = 2.0f;
 
         // The numbers the composition actually ran with, logged when any of them changes.
         //
@@ -2729,18 +2896,69 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         ID3D12Resource* resolveOriginal = targetSupportsUav ? g_nr.hdrCopy : target;
         ID3D12Resource* resolveTarget = targetSupportsUav ? target : g_nr.hdrCopy;
 
-        if (targetSupportsUav)
+        const bool isRrPreMode = frame.RayReconstruction && frame.BeforeUpscale &&
+                                 (cfg.DlssNrRrSolutionA.value_or_default() || cfg.DlssNrRrSolutionB.value_or_default());
+
+        if (isRrPreMode)
+        {
+            if (g_nr.preEnhancedScratch == nullptr)
+                g_nr.preEnhancedScratch = CreateScratch(device, desc.Format, width, height);
+            if (cfg.DlssNrRrSolutionA.value_or_default() && g_nr.rrStructureScratch == nullptr)
+                g_nr.rrStructureScratch = CreateScratch(device, desc.Format, width, height);
+        }
+
+        ID3D12Resource* const actualResolveTarget = (isRrPreMode && g_nr.preEnhancedScratch != nullptr)
+                                                        ? g_nr.preEnhancedScratch
+                                                        : resolveTarget;
+
+        if (targetSupportsUav && !isRrPreMode)
         {
             TransitionTarget(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         }
-        else
+        else if (!targetSupportsUav && !isRrPreMode)
         {
             Barrier(cmdList, g_nr.hdrCopy, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         }
 
-        DispatchPass(cmdList, resolveParams, resolveProxy, resolveAnswer, resolveOriginal, motionIn,
-                     exposureTex, resolveTarget, nullptr);
+        DispatchPass(cmdList, resolveParams, resolveProxy, resolveAnswer, resolveOriginal, activeMotion,
+                     exposureTex, actualResolveTarget, nullptr);
+
+        if (isRrPreMode && g_nr.preEnhancedScratch != nullptr)
+        {
+            if (targetSupportsUav)
+                TransitionTarget(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            else
+                Barrier(cmdList, g_nr.hdrCopy, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+            Barrier(cmdList, g_nr.preEnhancedScratch, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+            DlssNrConstants decompParams {};
+            decompParams.Mode = DlssNrMode_RrDecompose;
+            decompParams.Width = width;
+            decompParams.Height = height;
+            decompParams.RrMode = cfg.DlssNrRrSolutionB.value_or_default() ? 2u : 1u;
+            decompParams.RrStructureBoost = cfg.DlssNrRrStructureBoost.value_or_default();
+
+            DispatchPass(cmdList, decompParams, g_nr.preEnhancedScratch, nullptr, resolveOriginal,
+                         nullptr, nullptr, resolveTarget, g_nr.rrStructureScratch);
+
+            Barrier(cmdList, g_nr.preEnhancedScratch, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+            if (cfg.DlssNrRrSolutionA.value_or_default() && g_nr.rrStructureScratch != nullptr)
+            {
+                Barrier(cmdList, g_nr.rrStructureScratch, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                g_nr.rrStructureValid = true;
+            }
+            else
+            {
+                g_nr.rrStructureValid = false;
+            }
+        }
 
         if (!targetSupportsUav)
         {
@@ -2854,6 +3072,14 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     if (g_nr.motionClone != nullptr)
         Barrier(cmdList, g_nr.motionClone, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                 D3D12_RESOURCE_STATE_COPY_DEST);
+
+    if (g_nr.dilatedMotion != nullptr && activeMotion == g_nr.dilatedMotion)
+        Barrier(cmdList, g_nr.dilatedMotion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    if (g_nr.controlMaskScratch != nullptr)
+        Barrier(cmdList, g_nr.controlMaskScratch, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     if (reduced && g_nr.colorSmall != nullptr)
         Barrier(cmdList, g_nr.colorSmall, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
@@ -2982,7 +3208,11 @@ void EvaluateInternal(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* p
 
     const bool configuredBefore = cfg.DlssNrRunBeforeSr.value_or_default() &&
                                   preSrCompatible;
-    if (configuredBefore != beforeUpscale)
+    const bool isRrPostInjection = !beforeUpscale && rayReconstruction &&
+                                   cfg.DlssNrRrSolutionA.value_or_default() &&
+                                   g_nr.rrStructureValid;
+
+    if (!isRrPostInjection && configuredBefore != beforeUpscale)
         return;
 
     // Which of the game's APIs this evaluate arrived through.
@@ -3042,6 +3272,15 @@ void EvaluateInternal(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* p
     frame.BeforeUpscale = beforeUpscale;
     frame.RayReconstruction = rayReconstruction;
     frame.SubmissionEpoch = timingQueue != nullptr ? submissionEpoch : State::Instance().frameCount;
+
+    float jitterX = 0.0f, jitterY = 0.0f;
+    if (params->Get(NVSDK_NGX_Parameter_Jitter_Offset_X, &jitterX) == NVSDK_NGX_Result_Success &&
+        params->Get(NVSDK_NGX_Parameter_Jitter_Offset_Y, &jitterY) == NVSDK_NGX_Result_Success)
+    {
+        frame.HasJitter = true;
+        frame.JitterOffsetX = jitterX;
+        frame.JitterOffsetY = jitterY;
+    }
 
     // Color and Output may use different formats even though DLSS treats them as the same frame colour
     // space. Output is the stable authority across injection points; target is only a fallback for a
@@ -3543,6 +3782,39 @@ void Shutdown()
         g_nr.motionClone->Release();
         g_nr.motionClone = nullptr;
     }
+
+    if (g_nr.dilatedMotion != nullptr)
+    {
+        g_nr.dilatedMotion->Release();
+        g_nr.dilatedMotion = nullptr;
+    }
+
+    if (g_nr.controlMaskScratch != nullptr)
+    {
+        g_nr.controlMaskScratch->Release();
+        g_nr.controlMaskScratch = nullptr;
+    }
+
+    if (g_nr.prevDepth != nullptr)
+    {
+        g_nr.prevDepth->Release();
+        g_nr.prevDepth = nullptr;
+    }
+    g_nr.hasPrevDepth = false;
+    g_nr.hasPrevJitter = false;
+
+    if (g_nr.rrStructureScratch != nullptr)
+    {
+        g_nr.rrStructureScratch->Release();
+        g_nr.rrStructureScratch = nullptr;
+    }
+
+    if (g_nr.preEnhancedScratch != nullptr)
+    {
+        g_nr.preEnhancedScratch->Release();
+        g_nr.preEnhancedScratch = nullptr;
+    }
+    g_nr.rrStructureValid = false;
 
     g_capture.release();
     g_gpuTime.reset();

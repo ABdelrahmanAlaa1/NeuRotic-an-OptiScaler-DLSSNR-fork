@@ -326,6 +326,13 @@ bool Config::Reload(std::filesystem::path iniPath)
             DlssNrPrecision.set_from_config(readUInt("DlssNr", "Precision"));
             if (DlssNrPrecision.value_or_default() != 4) DlssNrPrecision = 0u;
             DlssNrResidualFgApproxCamera.set_from_config(readBool("DlssNr", "ResidualFGApproxCamera"));
+            DlssNrDilateMotionVectors.set_from_config(readBool("DlssNr", "DilateMotionVectors"));
+            DlssNrCompensateJitter.set_from_config(readBool("DlssNr", "CompensateJitter"));
+            DlssNrGenerateControlMask.set_from_config(readBool("DlssNr", "GenerateControlMask"));
+            DlssNrMotionAdaptiveGuard.set_from_config(readBool("DlssNr", "MotionAdaptiveGuard"));
+            DlssNrRrSolutionA.set_from_config(readBool("DlssNr", "RrSolutionA"));
+            DlssNrRrSolutionB.set_from_config(readBool("DlssNr", "RrSolutionB"));
+            DlssNrRrStructureBoost.set_from_config(readFloat("DlssNr", "RrStructureBoost"));
             DlssNrToggleKey.set_from_config(readInt("DlssNr", "ToggleKey"));
             DlssNrTransferStrength.set_from_config(readFloat("DlssNr", "TransferStrength"));
             DlssNrColourStrength.set_from_config(readFloat("DlssNr", "ColourStrength"));
@@ -1249,6 +1256,13 @@ bool Config::SaveIni()
     ini.SetValue("DlssNr", "ResidualFG", GetBoolValue(Instance()->DlssNrResidualFg.value_for_config()).c_str());
     ini.SetValue("DlssNr", "Precision", GetIntValue(Instance()->DlssNrPrecision.value_for_config()).c_str());
     ini.SetValue("DlssNr", "ResidualFGApproxCamera", GetBoolValue(Instance()->DlssNrResidualFgApproxCamera.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "DilateMotionVectors", GetBoolValue(Instance()->DlssNrDilateMotionVectors.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "CompensateJitter", GetBoolValue(Instance()->DlssNrCompensateJitter.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "GenerateControlMask", GetBoolValue(Instance()->DlssNrGenerateControlMask.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "MotionAdaptiveGuard", GetBoolValue(Instance()->DlssNrMotionAdaptiveGuard.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "RrSolutionA", GetBoolValue(Instance()->DlssNrRrSolutionA.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "RrSolutionB", GetBoolValue(Instance()->DlssNrRrSolutionB.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "RrStructureBoost", GetFloatValue(Instance()->DlssNrRrStructureBoost.value_for_config()).c_str());
     {
         auto toggle = Instance()->DlssNrToggleKey.value_for_config();
         ini.SetValue("DlssNr", "ToggleKey", GetIntValue(toggle, toggle > 0).c_str());

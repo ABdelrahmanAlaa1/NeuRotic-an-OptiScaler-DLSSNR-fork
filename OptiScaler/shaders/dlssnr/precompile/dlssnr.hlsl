@@ -35,6 +35,12 @@ cbuffer Params : register(b0)
     float gSkinColour;
     float gEnvironmentDetail;
     float gEnvironmentColour;
+    float gJitterDeltaX;
+    float gJitterDeltaY;
+    float gRrStructureBoost;
+    uint  gRrMode;
+    uint  gMotionAdaptiveGuard;
+    float gMotionClampingThreshold;
 };
 
 // Bringing an impossible colour back into a possible one.
@@ -557,6 +563,159 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         gTarget[id.xy] = valid ? float4(combined, 0, 1) : float4(65504, 65504, 0, 0);
         return;
     }
+    if (gMode == 12)
+    {
+        // Mode 12: DilateMotion - 3x3 depth foreground dilation with velocity coherence weighting + jitter compensation
+        int2 center = int2(id.xy);
+        float bestDepth = gPassthrough != 0 ? -1e30 : 1e30;
+        int2 bestOffset = int2(0, 0);
+
+        float2 centerCoord = (float2(center) + 0.5) / float2(gWidth, gHeight);
+        int2 depthCenter = int2(centerCoord * float2(gGuideWidth, gGuideHeight));
+        float2 centerMv = gSource.Load(int3(center, 0)).xy;
+
+        [unroll]
+        for (int dy = -1; dy <= 1; ++dy)
+        {
+            [unroll]
+            for (int dx = -1; dx <= 1; ++dx)
+            {
+                int2 mPos = clamp(center + int2(dx, dy), int2(0, 0), int2(gWidth - 1, gHeight - 1));
+                float2 uvSample = (float2(mPos) + 0.5) / float2(gWidth, gHeight);
+                int2 dPos = int2(uvSample * float2(gGuideWidth, gGuideHeight));
+                dPos = clamp(dPos, int2(0, 0), int2(gGuideWidth - 1, gGuideHeight - 1));
+
+                float d = gModel.Load(int3(dPos, 0)).r;
+                float2 sampleMv = gSource.Load(int3(mPos, 0)).xy;
+
+                if (isfinite(d) && all(isfinite(sampleMv)))
+                {
+                    float velDiff = length(sampleMv - centerMv);
+                    float velWeight = 1.0 / (1.0 + velDiff * 2.0);
+
+                    if (gPassthrough != 0) // Inverted depth (1.0 near, 0.0 far)
+                    {
+                        float weightedDepth = d * velWeight;
+                        if (weightedDepth > bestDepth)
+                        {
+                            bestDepth = weightedDepth;
+                            bestOffset = int2(dx, dy);
+                        }
+                    }
+                    else // Non-inverted depth (0.0 near, 1.0 far)
+                    {
+                        float weightedDepth = d / max(velWeight, 1e-4);
+                        if (weightedDepth < bestDepth)
+                        {
+                            bestDepth = weightedDepth;
+                            bestOffset = int2(dx, dy);
+                        }
+                    }
+                }
+            }
+        }
+
+        int2 dilatedPos = clamp(center + bestOffset, int2(0, 0), int2(gWidth - 1, gHeight - 1));
+        float2 mv = gSource.Load(int3(dilatedPos, 0)).xy;
+
+        mv.x += gJitterDeltaX;
+        mv.y += gJitterDeltaY;
+
+        gTarget[id.xy] = float4(mv, 0.0, 1.0);
+        return;
+    }
+    if (gMode == 13)
+    {
+        // Mode 13: ControlMask - Disocclusion detection + fast-motion whip-pan history flushing
+        int2 center = int2(id.xy);
+        float currDepth = gSource.Load(int3(center, 0)).r;
+        float2 rawMv = gMotion.Load(int3(center, 0)).xy;
+        float2 mv = rawMv * float2(gMvScaleX, gMvScaleY);
+
+        float2 prevUv = uv + mv;
+        float reactive = 0.0;
+
+        if (any(prevUv < 0.0) || any(prevUv > 1.0))
+        {
+            reactive = 1.0;
+        }
+        else
+        {
+            float prevDepth = gModel.SampleLevel(gLinear, prevUv, 0).r;
+            float depthDiff = abs(currDepth - prevDepth);
+            float depthThreshold = max(abs(currDepth) * 0.02, 1e-3);
+
+            if (depthDiff > depthThreshold)
+                reactive = 1.0;
+        }
+
+        float motionPixels = length(mv * float2(gWidth, gHeight));
+        float motionThreshold = max(gMotionClampingThreshold, 20.0);
+        if (motionPixels > motionThreshold)
+        {
+            float whipFlush = saturate((motionPixels - motionThreshold) / (motionThreshold * 2.0));
+            reactive = max(reactive, whipFlush);
+        }
+
+        gTarget[id.xy] = float4(reactive, reactive, reactive, 1.0);
+        return;
+    }
+    if (gMode == 14)
+    {
+        // Mode 14: RrDecompose - Pre-RR low-tone extraction or pre-amplification
+        int2 center = int2(id.xy);
+        float4 nrSample = gSource.Load(int3(center, 0));
+        float4 origSample = gOriginal.Load(int3(center, 0));
+        float3 nrColor = max(nrSample.rgb, 0.0);
+        float3 origColor = max(origSample.rgb, 0.0);
+
+        if (gRrMode == 2) // Solution B: Pre-RR Structure Multiplier
+        {
+            float3 delta = nrColor - origColor;
+            float boost = max(gRrStructureBoost, 0.0);
+            float3 boosted = max(origColor + delta * boost, 0.0);
+            gTarget[id.xy] = float4(boosted, origSample.a);
+            return;
+        }
+        else // Solution A: Hybrid Pre-Tone + Post-Structure Extraction
+        {
+            float3 lowTone = 0.0;
+            float totalWeight = 0.0;
+            [unroll]
+            for (int dy = -2; dy <= 2; ++dy)
+            {
+                [unroll]
+                for (int dx = -2; dx <= 2; ++dx)
+                {
+                    int2 pos = clamp(center + int2(dx, dy), int2(0, 0), int2(gWidth - 1, gHeight - 1));
+                    float3 s = max(gSource.Load(int3(pos, 0)).rgb, 0.0);
+                    float w = 1.0;
+                    lowTone += s * w;
+                    totalWeight += w;
+                }
+            }
+            lowTone /= max(totalWeight, 1e-4);
+
+            float3 highStructure = nrColor - lowTone;
+
+            gTarget[id.xy] = float4(lowTone, origSample.a);
+            gKeep[id.xy] = float4(highStructure, 1.0);
+            return;
+        }
+    }
+    if (gMode == 15)
+    {
+        // Mode 15: RrInject - Post-RR composite injection of high-frequency structure delta
+        int2 center = int2(id.xy);
+        float4 rrOut = gOriginal.Load(int3(center, 0));
+
+        float3 highStructure = gSource.SampleLevel(gLinear, uv, 0).rgb;
+        float boost = max(gRrStructureBoost, 0.0);
+
+        float3 finalRgb = max(rrOut.rgb + highStructure * boost, 0.0);
+        gTarget[id.xy] = float4(finalRgb, rrOut.a);
+        return;
+    }
 
     // The meter. One thread per tile of a 64x64 grid over the frame, writing that tile's mean
     // luminance. The frame is raw linear here -- this runs before the encode, on purpose, because the
@@ -1039,7 +1198,17 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // One scalar, taken from luminance, applied to the whole triple. A per-channel bound is a hue
     // distorter -- on a saturated pixel the smallest channel reaches the bound first, so an
     // achromatic edit lands as a colour shift.
-    const float guard = max(gMaxRatio, 1.0);
+    float guard = max(gMaxRatio, 1.0);
+    float motionPixels = 0.0;
+    if (gMotionAdaptiveGuard != 0)
+    {
+        int2 mCoord = int2(float2(id.xy) * float2(gGuideWidth, gGuideHeight) / float2(gWidth, gHeight));
+        mCoord = clamp(mCoord, int2(0, 0), int2(gGuideWidth - 1, gGuideHeight - 1));
+        float2 mv = gMotion.Load(int3(mCoord, 0)).xy * float2(gMvScaleX, gMvScaleY);
+        motionPixels = length(mv * float2(gWidth, gHeight));
+        float motionFactor = saturate(motionPixels * 0.1);
+        guard = lerp(guard, 1.05, motionFactor);
+    }
     float boundedRatio = clamp(amplified, 1.0 / guard, guard);
 
     // Exactly one while the ratio is already inside the guard, so a frame that never needed bounding
@@ -1055,6 +1224,26 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // (maximally vivid but still a real colour with detail) instead of flattening into a blown peak.
     // At strength 1 the boost is the identity, so <=1 is bit-identical to before.
     float3 result = lerp(original * boundedRatio, upgraded, min(gColourStrength, 1.0));
+
+    if (gMotionAdaptiveGuard != 0 && motionPixels > 1.5)
+    {
+        float3 cMin = original;
+        float3 cMax = original;
+        [unroll]
+        for (int sy = -1; sy <= 1; ++sy)
+        {
+            [unroll]
+            for (int sx = -1; sx <= 1; ++sx)
+            {
+                int2 sPos = clamp(int2(id.xy) + int2(sx, sy), int2(0, 0), int2(gWidth - 1, gHeight - 1));
+                float3 sCol = max(gOriginal.Load(int3(sPos, 0)).rgb, 0.0);
+                cMin = min(cMin, sCol);
+                cMax = max(cMax, sCol);
+            }
+        }
+        float clampWeight = saturate((motionPixels - 1.5) * 0.2);
+        result = lerp(result, clamp(result, cMin * 0.9, cMax * 1.1), clampWeight);
+    }
 
     if (gColourStrength > 1.0)
         result = ClampAp1(FromOkLab(float3(1.0, gColourStrength, gColourStrength) * ToOkLab(max(result, 0.0))));

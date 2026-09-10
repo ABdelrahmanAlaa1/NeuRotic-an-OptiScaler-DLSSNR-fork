@@ -60,12 +60,17 @@ void setResource(void *params, const char *name, ID3D12Resource *v) {
 
 using PFN_NrInitExt = int(__cdecl *)(unsigned long long, const wchar_t *, ID3D12Device *, int,
                                      const void *);
+static ID3D12Resource* g_controlMask = nullptr;
+
 // An explicit ControlMask takes precedence over the runtime's automatic mask.
-// We do not supply one; clear it on the reusable parameter block instead of
-// allowing another feature's stale mask/resource to silently override this toggle.
 void setAutomaticMask(void *params, int enabled) {
-    setResourcePtr(params, "DLSSNR.ControlMask", nullptr);
-    setUInt(params, "DLSSNR.UseAutoMask", enabled != 0 ? 1u : 0u);
+    if (g_controlMask != nullptr) {
+        setResource(params, "DLSSNR.ControlMask", g_controlMask);
+        setUInt(params, "DLSSNR.UseAutoMask", 0u);
+    } else {
+        setResourcePtr(params, "DLSSNR.ControlMask", nullptr);
+        setUInt(params, "DLSSNR.UseAutoMask", enabled != 0 ? 1u : 0u);
+    }
 }
 using PFN_NrCreate = int(__cdecl *)(ID3D12GraphicsCommandList *, int, const void *, void **);
 using PFN_NrEvaluate = int(__cdecl *)(ID3D12GraphicsCommandList *, const void *, const void *, void *);
@@ -932,6 +937,18 @@ __declspec(dllexport) void dlssnr_call_release(void *feature) {
         volatile int result = owner->second->release(feature); // retain this module's caller frame
         (void) result;
         g_featureOwners.erase(owner);
+    }
+}
+
+__declspec(dllexport) void dlssnr_call_set_control_mask(void *capabilityParams, ID3D12Resource *mask) {
+    g_controlMask = mask;
+    if (capabilityParams) {
+        if (mask != nullptr) {
+            setResource(capabilityParams, "DLSSNR.ControlMask", mask);
+            setUInt(capabilityParams, "DLSSNR.UseAutoMask", 0u);
+        } else {
+            setResourcePtr(capabilityParams, "DLSSNR.ControlMask", nullptr);
+        }
     }
 }
 
