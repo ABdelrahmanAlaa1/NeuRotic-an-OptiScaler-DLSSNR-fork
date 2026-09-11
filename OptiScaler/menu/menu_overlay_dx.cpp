@@ -291,8 +291,6 @@ static void RenderImGui_DX12(IDXGISwapChain* pSwapChainPlain)
         return;
     }
 
-    LOG_FUNC();
-
     // Get device from swapchain
     ID3D12Device* device = g_pd3dDeviceParam;
 
@@ -442,6 +440,14 @@ static void RenderImGui_DX12(IDXGISwapChain* pSwapChainPlain)
                 ImGui::Render();
 
                 UINT backBufferIdx = pSwapChain->GetCurrentBackBufferIndex();
+                if (backBufferIdx >= NUM_BACK_BUFFERS || g_commandAllocators[backBufferIdx] == nullptr || g_mainRenderTargetResource[backBufferIdx] == nullptr)
+                {
+                    LOG_WARN("Invalid backBufferIdx {} or render target not ready", backBufferIdx);
+                    CleanupRenderTargetDx12(false);
+                    pSwapChain->Release();
+                    return;
+                }
+
                 ID3D12CommandAllocator* commandAllocator = g_commandAllocators[backBufferIdx];
 
                 auto result = commandAllocator->Reset();
@@ -533,8 +539,6 @@ void MenuOverlayDx::Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
         MenuOverlayBase::Present();
         return;
     }
-
-    LOG_DEBUG("");
 
     ID3D12CommandQueue* cq = nullptr;
     ID3D11Device* device = nullptr;

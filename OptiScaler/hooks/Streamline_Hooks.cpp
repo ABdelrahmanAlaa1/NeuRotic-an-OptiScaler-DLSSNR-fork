@@ -1143,7 +1143,12 @@ sl::Result StreamlineHooks::hkslDLSSGSetOptions(const sl::ViewportHandle& viewpo
 
     applyMenuDlssgInterlock(newOptions, dlssgPotentiallyActive);
 
-    LOG_TRACE("DLSSG Modified Mode: {}", magic_enum::enum_name(newOptions.mode));
+    static sl::DLSSGMode lastLoggedDlssgMode = (sl::DLSSGMode) -999;
+    if (newOptions.mode != lastLoggedDlssgMode)
+    {
+        LOG_DEBUG("DLSSG Modified Mode: {}", magic_enum::enum_name(newOptions.mode));
+        lastLoggedDlssgMode = newOptions.mode;
+    }
 
     if (dlssgPotentiallyActive && state.streamlineVersion >= feature_version { 2, 7, 1 })
     {

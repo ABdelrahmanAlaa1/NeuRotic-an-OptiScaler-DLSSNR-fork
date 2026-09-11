@@ -195,8 +195,6 @@ void fakenvapi::reportFGPresent(IDXGISwapChain* pSwapChain, bool fg_state, bool 
 
 bool fakenvapi::updateModeAndContext()
 {
-    LOG_FUNC();
-
     auto lowLatencyCtx = LowLatencyCtx::get();
 
     if (!lowLatencyCtx)
