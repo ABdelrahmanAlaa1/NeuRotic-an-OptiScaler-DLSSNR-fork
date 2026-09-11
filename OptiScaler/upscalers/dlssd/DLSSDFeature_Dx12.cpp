@@ -205,7 +205,7 @@ bool DLSSDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList
             {
                 case NVSDK_NGX_PerfQuality_Value_DLAA: presetKey = "RayReconstruction.Hint.Render.Preset.DLAA"; break;
                 case NVSDK_NGX_PerfQuality_Value_UltraQuality: presetKey = "RayReconstruction.Hint.Render.Preset.UltraQuality"; break;
-                case NVSDK_NGX_PerfQuality_Value_Quality: presetKey = "RayReconstruction.Hint.Render.Preset.Quality"; break;
+                case NVSDK_NGX_PerfQuality_Value_MaxQuality: presetKey = "RayReconstruction.Hint.Render.Preset.Quality"; break;
                 case NVSDK_NGX_PerfQuality_Value_Balanced: presetKey = "RayReconstruction.Hint.Render.Preset.Balanced"; break;
                 case NVSDK_NGX_PerfQuality_Value_MaxPerf: presetKey = "RayReconstruction.Hint.Render.Preset.Performance"; break;
                 case NVSDK_NGX_PerfQuality_Value_UltraPerformance: presetKey = "RayReconstruction.Hint.Render.Preset.UltraPerformance"; break;
