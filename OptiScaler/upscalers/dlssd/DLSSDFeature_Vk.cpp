@@ -1,6 +1,8 @@
 #include <pch.h>
 #include <Config.h>
 #include <Logger.h>
+#include <nvsdk_ngx_defs_dlssd.h>
+#include <dlssnr/DlssNrFeature_Vk.h>
 
 #include "DLSSDFeature_Vk.h"
 
@@ -82,6 +84,25 @@ bool DLSSDFeatureVk::EvaluateInternal(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Par
         return false;
     }
 
+    const auto& cfg = *Config::Instance();
+
+    // Sub-approach 3c: ColorBeforeTransparency guide trick
+    void* origColorBeforeTrans = nullptr;
+    bool colorBeforeTransInjected = false;
+    if (cfg.DlssNrRrSolutionC.value_or_default() && cfg.DlssNrSolCUseTransparencyGuide.value_or_default())
+    {
+        void* colorResource = nullptr;
+        InParameters->Get(NVSDK_NGX_Parameter_Color, &colorResource);
+        if (colorResource != nullptr)
+        {
+            if (InParameters->Get(NVSDK_NGX_Parameter_DLSSD_ColorBeforeTransparency, &origColorBeforeTrans) != NVSDK_NGX_Result_Success || origColorBeforeTrans == nullptr)
+            {
+                InParameters->Set(NVSDK_NGX_Parameter_DLSSD_ColorBeforeTransparency, colorResource);
+                colorBeforeTransInjected = true;
+            }
+        }
+    }
+
     if (NVNGXProxy::VULKAN_EvaluateFeature() != nullptr)
     {
         ProcessEvaluateParams(InParameters);
@@ -99,6 +120,11 @@ bool DLSSDFeatureVk::EvaluateInternal(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Par
     {
         LOG_ERROR("_EvaluateFeature is nullptr");
         return false;
+    }
+
+    if (colorBeforeTransInjected)
+    {
+        InParameters->Set(NVSDK_NGX_Parameter_DLSSD_ColorBeforeTransparency, origColorBeforeTrans);
     }
 
     return true;

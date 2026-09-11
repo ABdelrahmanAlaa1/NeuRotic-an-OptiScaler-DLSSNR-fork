@@ -785,6 +785,10 @@ extern "C"
 #define NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance "DLSS.Hint.Render.Preset.UltraPerformance"
 #define NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality "DLSS.Hint.Render.Preset.UltraQuality"
 
+#define NVSDK_NGX_Parameter_DLSS_ResponsivityMask "DLSS.ResponsivityMask"
+#define NVSDK_NGX_Parameter_DLSS_ResponsivityMask_Subrect_Base_X "DLSS.ResponsivityMask.Subrect.Base.X"
+#define NVSDK_NGX_Parameter_DLSS_ResponsivityMask_Subrect_Base_Y "DLSS.ResponsivityMask.Subrect.Base.Y"
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

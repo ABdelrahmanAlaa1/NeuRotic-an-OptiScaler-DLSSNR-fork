@@ -69,6 +69,11 @@ std::optional<double> LastGpuTimeVk();
 // whether reading it is worth the risk on any real Vulkan game.
 bool ExposureOfferedVk();
 
+// Solution C: Guide buffer accessors (Vulkan fallback)
+inline bool HasModifiedGuidesVk() { return false; }
+inline void* GetModifiedDiffuseAlbedoVk() { return nullptr; }
+inline void* GetModifiedSpecularAlbedoVk() { return nullptr; }
+
 void ShutdownVk(bool deviceAlive = true);
 
 } // namespace DlssNr

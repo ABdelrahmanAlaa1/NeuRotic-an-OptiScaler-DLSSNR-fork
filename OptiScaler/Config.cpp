@@ -333,6 +333,14 @@ bool Config::Reload(std::filesystem::path iniPath)
             DlssNrRrSolutionA.set_from_config(readBool("DlssNr", "RrSolutionA"));
             DlssNrRrSolutionB.set_from_config(readBool("DlssNr", "RrSolutionB"));
             DlssNrRrStructureBoost.set_from_config(readFloat("DlssNr", "RrStructureBoost"));
+            DlssNrRrSolutionC.set_from_config(readBool("DlssNr", "RrSolutionC"));
+            DlssNrSolCAlbedoBlend.set_from_config(readFloat("DlssNr", "SolCAlbedoBlend"));
+            DlssNrSolCSpecularBoost.set_from_config(readFloat("DlssNr", "SolCSpecularBoost"));
+            DlssNrSolCUseTransparencyGuide.set_from_config(readBool("DlssNr", "SolCUseTransparencyGuide"));
+            DlssNrSolBVarianceThreshold.set_from_config(readFloat("DlssNr", "SolBVarianceThreshold"));
+            DlssNrTemporalHistory.set_from_config(readBool("DlssNr", "TemporalHistory"));
+            DlssNrTemporalWindow.set_from_config(readUInt("DlssNr", "TemporalWindow"));
+            DlssNrTemporalClampSigma.set_from_config(readFloat("DlssNr", "TemporalClampSigma"));
             DlssNrToggleKey.set_from_config(readInt("DlssNr", "ToggleKey"));
             DlssNrTransferStrength.set_from_config(readFloat("DlssNr", "TransferStrength"));
             DlssNrColourStrength.set_from_config(readFloat("DlssNr", "ColourStrength"));
@@ -484,6 +492,9 @@ bool Config::Reload(std::filesystem::path iniPath)
             if (auto setting = readInt("DLSSD", "RenderPresetUltraPerformance");
                 setting.has_value() && setting >= 0 && (setting < presetCount || setting == NV_PRESET_LATEST))
                 DLSSDRenderPresetUltraPerformance.set_from_config(setting);
+
+            DLSSDRRResponsivityMaskEnabled.set_from_config(readBool("DLSSD", "RRResponsivityMaskEnabled"));
+            DLSSDRRResponsivityMaskValue.set_from_config(readFloat("DLSSD", "RRResponsivityMaskValue"));
         }
 
         // NvngxFG
@@ -1263,6 +1274,14 @@ bool Config::SaveIni()
     ini.SetValue("DlssNr", "RrSolutionA", GetBoolValue(Instance()->DlssNrRrSolutionA.value_for_config()).c_str());
     ini.SetValue("DlssNr", "RrSolutionB", GetBoolValue(Instance()->DlssNrRrSolutionB.value_for_config()).c_str());
     ini.SetValue("DlssNr", "RrStructureBoost", GetFloatValue(Instance()->DlssNrRrStructureBoost.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "RrSolutionC", GetBoolValue(Instance()->DlssNrRrSolutionC.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "SolCAlbedoBlend", GetFloatValue(Instance()->DlssNrSolCAlbedoBlend.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "SolCSpecularBoost", GetFloatValue(Instance()->DlssNrSolCSpecularBoost.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "SolCUseTransparencyGuide", GetBoolValue(Instance()->DlssNrSolCUseTransparencyGuide.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "SolBVarianceThreshold", GetFloatValue(Instance()->DlssNrSolBVarianceThreshold.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "TemporalHistory", GetBoolValue(Instance()->DlssNrTemporalHistory.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "TemporalWindow", GetIntValue(Instance()->DlssNrTemporalWindow.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "TemporalClampSigma", GetFloatValue(Instance()->DlssNrTemporalClampSigma.value_for_config()).c_str());
     {
         auto toggle = Instance()->DlssNrToggleKey.value_for_config();
         ini.SetValue("DlssNr", "ToggleKey", GetIntValue(toggle, toggle > 0).c_str());
@@ -1397,6 +1416,10 @@ bool Config::SaveIni()
                      GetIntValue(Instance()->DLSSDRenderPresetPerformance.value_for_config()).c_str());
         ini.SetValue("DLSSD", "RenderPresetUltraPerformance",
                      GetIntValue(Instance()->DLSSDRenderPresetUltraPerformance.value_for_config()).c_str());
+        ini.SetValue("DLSSD", "RRResponsivityMaskEnabled",
+                     GetBoolValue(Instance()->DLSSDRRResponsivityMaskEnabled.value_for_config()).c_str());
+        ini.SetValue("DLSSD", "RRResponsivityMaskValue",
+                     GetFloatValue(Instance()->DLSSDRRResponsivityMaskValue.value_for_config()).c_str());
     }
 
     // NvngxFG

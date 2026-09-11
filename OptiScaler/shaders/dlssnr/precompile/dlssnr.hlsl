@@ -41,6 +41,15 @@ cbuffer Params : register(b0)
     uint  gRrMode;
     uint  gMotionAdaptiveGuard;
     float gMotionClampingThreshold;
+    uint  gTemporalHistoryEnabled;
+    uint  gTemporalHistoryWindow;
+    float gTemporalClampSigma;
+    float gVarianceThreshold;
+    float gSolCAlbedoBlend;
+    float gSolCSpecularBoost;
+    uint  gSolCUseTransparencyGuide;
+    float gPad0;
+    float gPad1;
 };
 
 // Bringing an impossible colour back into a possible one.
@@ -87,6 +96,25 @@ float3 SanitizeFinite3(float3 v, float3 fallback)
 float SafeDivide(float numerator, float denominator, float fallback)
 {
     return abs(denominator) > 1e-8 ? numerator / denominator : fallback;
+}
+
+float3 RGBToYCoCg(float3 c)
+{
+    float y  =  0.25 * c.r + 0.5 * c.g + 0.25 * c.b;
+    float co =  0.50 * c.r             - 0.50 * c.b;
+    float cg = -0.25 * c.r + 0.5 * c.g - 0.25 * c.b;
+    return float3(y, co, cg);
+}
+
+float3 YCoCgToRGB(float3 c)
+{
+    float y  = c.x;
+    float co = c.y;
+    float cg = c.z;
+    float r = y + co - cg;
+    float g = y + cg;
+    float b = y - co - cg;
+    return float3(r, g, b);
 }
 
 // Hunt-Pointer-Estevez LMS over linear BT.709, carrying the fixed D65 adaptation state the
@@ -632,6 +660,10 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         float2 rawMv = gMotion.Load(int3(center, 0)).xy;
         float2 mv = rawMv * float2(gMvScaleX, gMvScaleY);
 
+        // Subpixel camera jitter compensation
+        mv.x += gJitterDeltaX;
+        mv.y += gJitterDeltaY;
+
         float2 prevUv = uv + mv;
         float reactive = 0.0;
 
@@ -641,11 +673,23 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         }
         else
         {
-            float prevDepth = gModel.SampleLevel(gLinear, prevUv, 0).r;
-            float depthDiff = abs(currDepth - prevDepth);
-            float depthThreshold = max(abs(currDepth) * 0.02, 1e-3);
+            // Point sample previous depth using a 3x3 window to prevent false disocclusions on moving surfaces
+            int2 prevCenter = clamp(int2(prevUv * float2(gGuideWidth, gGuideHeight)), int2(0, 0), int2(gGuideWidth - 1, gGuideHeight - 1));
+            float minPrevDiff = 1e9;
+            [unroll]
+            for (int dy = -1; dy <= 1; ++dy)
+            {
+                [unroll]
+                for (int dx = -1; dx <= 1; ++dx)
+                {
+                    int2 p = clamp(prevCenter + int2(dx, dy), int2(0, 0), int2(gGuideWidth - 1, gGuideHeight - 1));
+                    float prevD = gModel.Load(int3(p, 0)).r;
+                    minPrevDiff = min(minPrevDiff, abs(currDepth - prevD));
+                }
+            }
 
-            if (depthDiff > depthThreshold)
+            float depthThreshold = max(abs(currDepth) * 0.02, 1e-3);
+            if (minPrevDiff > depthThreshold)
                 reactive = 1.0;
         }
 
@@ -662,46 +706,21 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     }
     if (gMode == 14)
     {
-        // Mode 14: RrDecompose - Pre-RR low-tone extraction or pre-amplification
+        // Mode 14: RrDecompose - Solution A: Pre-RR tone extraction and structure decomposition
         int2 center = int2(id.xy);
         float4 nrSample = gSource.Load(int3(center, 0));
         float4 origSample = gOriginal.Load(int3(center, 0));
         float3 nrColor = max(nrSample.rgb, 0.0);
         float3 origColor = max(origSample.rgb, 0.0);
 
-        if (gRrMode == 2) // Solution B: Pre-RR Structure Multiplier
-        {
-            float3 delta = nrColor - origColor;
-            float boost = max(gRrStructureBoost, 0.0);
-            float3 boosted = max(origColor + delta * boost, 0.0);
-            gTarget[id.xy] = float4(boosted, origSample.a);
-            return;
-        }
-        else // Solution A: Hybrid Pre-Tone + Post-Structure Extraction
-        {
-            float3 lowTone = 0.0;
-            float totalWeight = 0.0;
-            [unroll]
-            for (int dy = -2; dy <= 2; ++dy)
-            {
-                [unroll]
-                for (int dx = -2; dx <= 2; ++dx)
-                {
-                    int2 pos = clamp(center + int2(dx, dy), int2(0, 0), int2(gWidth - 1, gHeight - 1));
-                    float3 s = max(gSource.Load(int3(pos, 0)).rgb, 0.0);
-                    float w = 1.0;
-                    lowTone += s * w;
-                    totalWeight += w;
-                }
-            }
-            lowTone /= max(totalWeight, 1e-4);
+        // High frequency structure delta between NR model output and original color
+        float3 highStructure = nrColor - origColor;
 
-            float3 highStructure = nrColor - lowTone;
-
-            gTarget[id.xy] = float4(lowTone, origSample.a);
-            gKeep[id.xy] = float4(highStructure, 1.0);
-            return;
-        }
+        // Solution A feeds the pre-NR original into RR
+        gTarget[id.xy] = float4(origColor, origSample.a);
+        // Save the structure delta in gKeep (at render resolution) to be injected post-RR
+        gKeep[id.xy] = float4(highStructure, 1.0);
+        return;
     }
     if (gMode == 15)
     {
@@ -709,11 +728,141 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         int2 center = int2(id.xy);
         float4 rrOut = gOriginal.Load(int3(center, 0));
 
+        // Bilinear upsample from render-res structure scratch
         float3 highStructure = gSource.SampleLevel(gLinear, uv, 0).rgb;
         float boost = max(gRrStructureBoost, 0.0);
 
         float3 finalRgb = max(rrOut.rgb + highStructure * boost, 0.0);
         gTarget[id.xy] = float4(finalRgb, rrOut.a);
+        return;
+    }
+    if (gMode == 16)
+    {
+        // Mode 16: Temporal History - multi-frame YCoCg variance clamping to suppress boiling
+        int2 center = int2(id.xy);
+        float4 currentSample = gSource.Load(int3(center, 0));
+        float3 currentRgb = max(currentSample.rgb, 0.0);
+        float3 currentYCoCg = RGBToYCoCg(currentRgb);
+
+        // Compute 3x3 neighborhood statistics in YCoCg space
+        float3 m1 = 0.0;
+        float3 m2 = 0.0;
+        [unroll]
+        for (int dy = -1; dy <= 1; ++dy)
+        {
+            [unroll]
+            for (int dx = -1; dx <= 1; ++dx)
+            {
+                int2 pos = clamp(center + int2(dx, dy), int2(0, 0), int2(gWidth - 1, gHeight - 1));
+                float3 sRgb = max(gSource.Load(int3(pos, 0)).rgb, 0.0);
+                float3 sYCoCg = RGBToYCoCg(sRgb);
+                m1 += sYCoCg;
+                m2 += sYCoCg * sYCoCg;
+            }
+        }
+        float3 mu = m1 / 9.0;
+        float3 sigma = sqrt(max(m2 / 9.0 - mu * mu, 0.0));
+        float sigmaMult = max(gTemporalClampSigma, 0.1);
+        float3 boxMin = mu - sigma * sigmaMult;
+        float3 boxMax = mu + sigma * sigmaMult;
+
+        // Reproject previous history frame
+        float2 rawMv = gMotion.Load(int3(center, 0)).xy;
+        float2 mv = rawMv * float2(gMvScaleX, gMvScaleY);
+        mv.x += gJitterDeltaX;
+        mv.y += gJitterDeltaY;
+
+        float2 prevUv = uv + mv;
+        float3 resultRgb = currentRgb;
+
+        if (all(prevUv >= 0.0) && all(prevUv <= 1.0))
+        {
+            float3 prevRgb = max(gModel.SampleLevel(gLinear, prevUv, 0).rgb, 0.0);
+            float3 prevYCoCg = RGBToYCoCg(prevRgb);
+
+            // Clamp history to current neighborhood bounding box
+            float3 clampedYCoCg = clamp(prevYCoCg, boxMin, boxMax);
+            float3 clampedRgb = max(YCoCgToRGB(clampedYCoCg), 0.0);
+
+            // Temporal EMA blend
+            float blendWeight = 1.0 / max(float(gTemporalHistoryWindow), 1.0);
+            blendWeight = clamp(blendWeight, 0.05, 0.5);
+            resultRgb = lerp(clampedRgb, currentRgb, blendWeight);
+        }
+
+        gTarget[id.xy] = float4(resultRgb, currentSample.a);
+        gKeep[id.xy] = float4(resultRgb, 1.0); // Save as next frame's history
+        return;
+    }
+    if (gMode == 17)
+    {
+        // Mode 17: RrLumaBlend (Solution B) - Post-RR luma-only gradient blend with 3x3 variance mask
+        int2 center = int2(id.xy);
+        float4 nrSample = gSource.Load(int3(center, 0));     // Post-resolve / post-RR color
+        float4 origSample = gOriginal.Load(int3(center, 0)); // Original / pre-enhanced color
+        float3 nrRgb = max(nrSample.rgb, 0.0);
+        float3 origRgb = max(origSample.rgb, 0.0);
+
+        // Compute 3x3 neighborhood luminance variance
+        float lumaSum = 0.0;
+        float lumaSqSum = 0.0;
+        [unroll]
+        for (int dy = -1; dy <= 1; ++dy)
+        {
+            [unroll]
+            for (int dx = -1; dx <= 1; ++dx)
+            {
+                int2 pos = clamp(center + int2(dx, dy), int2(0, 0), int2(gWidth - 1, gHeight - 1));
+                float3 s = max(gSource.Load(int3(pos, 0)).rgb, 0.0);
+                float l = dot(s, kLuma);
+                lumaSum += l;
+                lumaSqSum += l * l;
+            }
+        }
+        float meanLuma = lumaSum / 9.0;
+        float lumaVariance = max(lumaSqSum / 9.0 - meanLuma * meanLuma, 0.0);
+
+        float origLuma = dot(origRgb, kLuma);
+        float nrLuma = dot(nrRgb, kLuma);
+        float deltaLuma = nrLuma - origLuma;
+
+        // Variance mask to restrict blend to high-frequency detail edges
+        float vThresh = max(gVarianceThreshold, 1e-4);
+        float edgeWeight = saturate(lumaVariance / vThresh);
+
+        float boost = max(gRrStructureBoost, 0.0);
+        float targetLuma = origLuma + deltaLuma * (1.0 + (boost - 1.0) * edgeWeight);
+        targetLuma = max(targetLuma, 0.0);
+
+        // Modulate RGB by luminance ratio — chroma remains untouched!
+        float3 outRgb = nrRgb * (targetLuma / max(nrLuma, 1e-4));
+        gTarget[id.xy] = float4(max(outRgb, 0.0), nrSample.a);
+        return;
+    }
+    if (gMode == 18)
+    {
+        // Mode 18: RrAlbedoBlend (Solution C) - Guide buffer modification
+        int2 pos = int2(id.xy);
+        float3 origColor = max(gSource.Load(int3(pos, 0)).rgb, 0.0);
+        float3 nrColor = max(gModel.Load(int3(pos, 0)).rgb, 0.0);
+        float4 gameDiffuse = gOriginal.Load(int3(pos, 0));
+        float4 gameSpecular = gMotion.Load(int3(pos, 0));
+
+        // Color ratio of NR additions relative to original
+        float3 colorRatio = nrColor / max(origColor, 1e-4);
+        colorRatio = clamp(colorRatio, 0.1, 10.0);
+
+        float blendStrength = saturate(gSolCAlbedoBlend);
+        float3 modDiffuse = gameDiffuse.rgb * lerp(float3(1.0, 1.0, 1.0), colorRatio, blendStrength);
+
+        // Specular boost based on high-frequency luminance delta
+        float3 delta = abs(nrColor - origColor);
+        float deltaLuma = dot(delta, kLuma);
+        float specBoost = max(gSolCSpecularBoost, 0.0);
+        float3 modSpecular = gameSpecular.rgb * (1.0 + specBoost * saturate(deltaLuma));
+
+        gTarget[pos] = float4(max(modDiffuse, 0.0), gameDiffuse.a);
+        gKeep[pos] = float4(max(modSpecular, 0.0), gameSpecular.a);
         return;
     }
 
@@ -1029,6 +1178,42 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         // Amplified and centred on grey, so both directions of the edit are visible at once.
         float3 shown = saturate(0.5 + edit * 20.0);
         gTarget[id.xy] = float4(SrgbToLinear(shown) * gDebugScale, originalSample.a);
+        return;
+    }
+
+    if (gDebugView == 4)
+    {
+        // Debug 4: Motion vectors visualization
+        float2 rawMv = gMotion.Load(int3(id.xy, 0)).xy;
+        float2 mv = rawMv * float2(gMvScaleX, gMvScaleY);
+        float3 shown = float3(saturate(mv.x * 50.0 + 0.5), saturate(mv.y * 50.0 + 0.5), 0.0);
+        gTarget[id.xy] = float4(shown * gDebugScale, originalSample.a);
+        return;
+    }
+
+    if (gDebugView == 5)
+    {
+        // Debug 5: Reactive / Disocclusion control mask
+        float maskVal = gMotion.Load(int3(id.xy, 0)).z;
+        float3 shown = maskVal.xxx;
+        gTarget[id.xy] = float4(shown * gDebugScale, originalSample.a);
+        return;
+    }
+
+    if (gDebugView == 6)
+    {
+        // Debug 6: Subpixel camera jitter delta
+        float3 shown = float3(saturate(gJitterDeltaX * 100.0 + 0.5), saturate(gJitterDeltaY * 100.0 + 0.5), 0.5);
+        gTarget[id.xy] = float4(shown * gDebugScale, originalSample.a);
+        return;
+    }
+
+    if (gDebugView == 7)
+    {
+        // Debug 7: RR structure delta
+        float3 delta = abs(model - proxy);
+        float3 shown = saturate(delta * 10.0);
+        gTarget[id.xy] = float4(shown * gDebugScale, originalSample.a);
         return;
     }
 

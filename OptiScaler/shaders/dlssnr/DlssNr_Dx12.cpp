@@ -22,6 +22,7 @@
 #include <State.h>
 #include <Util.h>
 
+#include <nvsdk_ngx_defs_dlssd.h>
 #include <proxies/NVNGX_Proxy.h>
 #include <hooks/D3D12_Hooks.h>
 #include <gpu_time/GpuTime_Dx12.h>
@@ -393,6 +394,16 @@ struct NrState
     ID3D12Resource* rrStructureScratch = nullptr;
     ID3D12Resource* preEnhancedScratch = nullptr;
     bool rrStructureValid = false;
+
+    // Temporal History ping-pong buffers
+    ID3D12Resource* temporalHistory[2] = { nullptr, nullptr };
+    uint32_t temporalHistoryIndex = 0;
+    bool temporalHistoryValid = false;
+
+    // RR Solution C guide buffers
+    ID3D12Resource* modifiedDiffuseAlbedo = nullptr;
+    ID3D12Resource* modifiedSpecularAlbedo = nullptr;
+    bool modifiedGuidesValid = false;
 
     // Once something fails there is no recovering it mid-session, and retrying every frame turns a
     // failure into a crash. It stays off and says why.
@@ -1659,6 +1670,15 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         cfg.DlssNrRrSolutionA.value_or_default() && g_nr.rrStructureValid &&
         g_nr.rrStructureScratch != nullptr)
     {
+        if (g_nr.preEnhancedScratch != nullptr)
+        {
+            const D3D12_RESOURCE_DESC scratchDesc = g_nr.preEnhancedScratch->GetDesc();
+            if (scratchDesc.Width != width || scratchDesc.Height != height || scratchDesc.Format != desc.Format)
+            {
+                g_nr.preEnhancedScratch->Release();
+                g_nr.preEnhancedScratch = nullptr;
+            }
+        }
         if (g_nr.preEnhancedScratch == nullptr)
             g_nr.preEnhancedScratch = CreateScratch(device, desc.Format, width, height);
 
@@ -1858,6 +1878,12 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             ParkNrResource(g_nr.rrStructureScratch);
             ParkNrResource(g_nr.preEnhancedScratch);
             g_nr.rrStructureValid = false;
+            ParkNrResource(g_nr.temporalHistory[0]);
+            ParkNrResource(g_nr.temporalHistory[1]);
+            g_nr.temporalHistoryValid = false;
+            ParkNrResource(g_nr.modifiedDiffuseAlbedo);
+            ParkNrResource(g_nr.modifiedSpecularAlbedo);
+            g_nr.modifiedGuidesValid = false;
             g_nr.passScratchFailed = false;
         }
     }
@@ -2566,6 +2592,8 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             maskParams.GuideHeight = guideHeight;
             maskParams.MvScaleX = g_nr.guideMvScaleX;
             maskParams.MvScaleY = g_nr.guideMvScaleY;
+            maskParams.JitterDeltaX = (activeMotion == g_nr.dilatedMotion) ? 0.0f : jitterDeltaX;
+            maskParams.JitterDeltaY = (activeMotion == g_nr.dilatedMotion) ? 0.0f : jitterDeltaY;
             maskParams.MotionClampingThreshold = 25.0f;
 
             ID3D12Resource* historyDepth = g_nr.hasPrevDepth ? g_nr.prevDepth : depthIn;
@@ -2762,20 +2790,24 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
 
         unsigned int style = 0;
         const NVSDK_NGX_Result styleResult = g_nr.capabilityParams->Get("DLSSNR.Style", &style);
-        LOG_DEBUG("DLSS-NR readback DLSSNR.Style -> {} (result 0x{:X})", style, (uint32_t) styleResult);
 
         // The preset is the last control whose arrival has never been checked, and three of them look
         // identical in play. Either it is not landing or the presets really are alike.
         unsigned int preset = 0;
         const NVSDK_NGX_Result presetResult =
             g_nr.capabilityParams->Get("DLSSNR.Hint.Render.Preset", &preset);
-        LOG_DEBUG("DLSS-NR readback DLSSNR.Hint.Render.Preset -> {} (result 0x{:X}, we wrote {})", preset,
-                 (uint32_t) presetResult, PassPreset(cfg, 0));
 
-        LOG_DEBUG("DLSS-NR wrote intensity {}, local structure {}, local tone {}, skin {}, style {}",
-                 cfg.DlssNrIntensity.value_or_default(), cfg.DlssNrLocalStructure.value_or_default(),
-                 cfg.DlssNrLocalTone.value_or_default(), cfg.DlssNrSkinStructure.value_or_default(),
-                 PassStyle(cfg, 0));
+        static uint32_t sNrLogThrottle = 0;
+        if ((sNrLogThrottle++ % 300) == 0)
+        {
+            LOG_DEBUG("DLSS-NR readback DLSSNR.Style -> {} (result 0x{:X})", style, (uint32_t) styleResult);
+            LOG_DEBUG("DLSS-NR readback DLSSNR.Hint.Render.Preset -> {} (result 0x{:X}, we wrote {})", preset,
+                     (uint32_t) presetResult, PassPreset(cfg, 0));
+            LOG_DEBUG("DLSS-NR wrote intensity {}, local structure {}, local tone {}, skin {}, style {}",
+                     cfg.DlssNrIntensity.value_or_default(), cfg.DlssNrLocalStructure.value_or_default(),
+                     cfg.DlssNrLocalTone.value_or_default(), cfg.DlssNrSkinStructure.value_or_default(),
+                     PassStyle(cfg, 0));
+        }
     }
 
     if (result == NVSDK_NGX_Result_Success)
@@ -2897,14 +2929,38 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         ID3D12Resource* resolveTarget = targetSupportsUav ? target : g_nr.hdrCopy;
 
         const bool isRrPreMode = frame.RayReconstruction && frame.BeforeUpscale &&
-                                 (cfg.DlssNrRrSolutionA.value_or_default() || cfg.DlssNrRrSolutionB.value_or_default());
+                                 (cfg.DlssNrRrSolutionA.value_or_default() ||
+                                  cfg.DlssNrRrSolutionB.value_or_default() ||
+                                  cfg.DlssNrRrSolutionC.value_or_default());
 
         if (isRrPreMode)
         {
+            if (g_nr.preEnhancedScratch != nullptr)
+            {
+                const auto sDesc = g_nr.preEnhancedScratch->GetDesc();
+                if (sDesc.Width != width || sDesc.Height != height || sDesc.Format != desc.Format)
+                {
+                    g_nr.preEnhancedScratch->Release();
+                    g_nr.preEnhancedScratch = nullptr;
+                }
+            }
             if (g_nr.preEnhancedScratch == nullptr)
                 g_nr.preEnhancedScratch = CreateScratch(device, desc.Format, width, height);
-            if (cfg.DlssNrRrSolutionA.value_or_default() && g_nr.rrStructureScratch == nullptr)
-                g_nr.rrStructureScratch = CreateScratch(device, desc.Format, width, height);
+
+            if (cfg.DlssNrRrSolutionA.value_or_default())
+            {
+                if (g_nr.rrStructureScratch != nullptr)
+                {
+                    const auto rDesc = g_nr.rrStructureScratch->GetDesc();
+                    if (rDesc.Width != width || rDesc.Height != height || rDesc.Format != desc.Format)
+                    {
+                        g_nr.rrStructureScratch->Release();
+                        g_nr.rrStructureScratch = nullptr;
+                    }
+                }
+                if (g_nr.rrStructureScratch == nullptr)
+                    g_nr.rrStructureScratch = CreateScratch(device, desc.Format, width, height);
+            }
         }
 
         ID3D12Resource* const actualResolveTarget = (isRrPreMode && g_nr.preEnhancedScratch != nullptr)
@@ -2935,28 +2991,205 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             Barrier(cmdList, g_nr.preEnhancedScratch, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
-            DlssNrConstants decompParams {};
-            decompParams.Mode = DlssNrMode_RrDecompose;
-            decompParams.Width = width;
-            decompParams.Height = height;
-            decompParams.RrMode = cfg.DlssNrRrSolutionB.value_or_default() ? 2u : 1u;
-            decompParams.RrStructureBoost = cfg.DlssNrRrStructureBoost.value_or_default();
+            if (cfg.DlssNrRrSolutionA.value_or_default())
+            {
+                DlssNrConstants decompParams {};
+                decompParams.Mode = DlssNrMode_RrDecompose;
+                decompParams.Width = width;
+                decompParams.Height = height;
 
-            DispatchPass(cmdList, decompParams, g_nr.preEnhancedScratch, nullptr, resolveOriginal,
-                         nullptr, nullptr, resolveTarget, g_nr.rrStructureScratch);
+                DispatchPass(cmdList, decompParams, g_nr.preEnhancedScratch, nullptr, resolveOriginal,
+                             nullptr, nullptr, resolveTarget, g_nr.rrStructureScratch);
+
+                if (g_nr.rrStructureScratch != nullptr)
+                {
+                    Barrier(cmdList, g_nr.rrStructureScratch, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    g_nr.rrStructureValid = true;
+                }
+                else
+                {
+                    g_nr.rrStructureValid = false;
+                }
+            }
+            else if (cfg.DlssNrRrSolutionB.value_or_default())
+            {
+                // Solution B: Post-model luma-only gradient blend
+                DlssNrConstants blendParams {};
+                blendParams.Mode = DlssNrMode_RrLumaBlend;
+                blendParams.Width = width;
+                blendParams.Height = height;
+                blendParams.RrStructureBoost = cfg.DlssNrRrStructureBoost.value_or_default();
+                blendParams.VarianceThreshold = cfg.DlssNrSolBVarianceThreshold.value_or_default();
+
+                DispatchPass(cmdList, blendParams, g_nr.preEnhancedScratch, nullptr, resolveOriginal,
+                             nullptr, nullptr, resolveTarget, nullptr);
+                g_nr.rrStructureValid = false;
+            }
+            else if (cfg.DlssNrRrSolutionC.value_or_default())
+            {
+                // Solution C: Modify copies of game diffuse and specular albedo guide buffers
+                if (frame.DiffuseAlbedo != nullptr && frame.SpecularAlbedo != nullptr)
+                {
+                    auto* gameDiffuse = static_cast<ID3D12Resource*>(frame.DiffuseAlbedo);
+                    auto* gameSpecular = static_cast<ID3D12Resource*>(frame.SpecularAlbedo);
+                    const D3D12_RESOURCE_DESC diffDesc = gameDiffuse->GetDesc();
+                    const D3D12_RESOURCE_DESC specDesc = gameSpecular->GetDesc();
+
+                    if (g_nr.modifiedDiffuseAlbedo != nullptr)
+                    {
+                        const auto mdDesc = g_nr.modifiedDiffuseAlbedo->GetDesc();
+                        if (mdDesc.Width != diffDesc.Width || mdDesc.Height != diffDesc.Height || mdDesc.Format != diffDesc.Format)
+                        {
+                            g_nr.modifiedDiffuseAlbedo->Release();
+                            g_nr.modifiedDiffuseAlbedo = nullptr;
+                        }
+                    }
+                    if (g_nr.modifiedDiffuseAlbedo == nullptr)
+                        g_nr.modifiedDiffuseAlbedo = CreateScratch(device, diffDesc.Format, (UINT)diffDesc.Width, diffDesc.Height);
+
+                    if (g_nr.modifiedSpecularAlbedo != nullptr)
+                    {
+                        const auto msDesc = g_nr.modifiedSpecularAlbedo->GetDesc();
+                        if (msDesc.Width != specDesc.Width || msDesc.Height != specDesc.Height || msDesc.Format != specDesc.Format)
+                        {
+                            g_nr.modifiedSpecularAlbedo->Release();
+                            g_nr.modifiedSpecularAlbedo = nullptr;
+                        }
+                    }
+                    if (g_nr.modifiedSpecularAlbedo == nullptr)
+                        g_nr.modifiedSpecularAlbedo = CreateScratch(device, specDesc.Format, (UINT)specDesc.Width, specDesc.Height);
+
+                    if (g_nr.modifiedDiffuseAlbedo != nullptr && g_nr.modifiedSpecularAlbedo != nullptr)
+                    {
+                        DlssNrConstants solCParams {};
+                        solCParams.Mode = DlssNrMode_RrAlbedoBlend;
+                        solCParams.Width = (UINT)diffDesc.Width;
+                        solCParams.Height = diffDesc.Height;
+                        solCParams.SolCAlbedoBlend = cfg.DlssNrSolCAlbedoBlend.value_or_default();
+                        solCParams.SolCSpecularBoost = cfg.DlssNrSolCSpecularBoost.value_or_default();
+
+                        Barrier(cmdList, g_nr.modifiedDiffuseAlbedo, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                        Barrier(cmdList, g_nr.modifiedSpecularAlbedo, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+                        DispatchPass(cmdList, solCParams, resolveOriginal, g_nr.preEnhancedScratch,
+                                     gameDiffuse, gameSpecular, nullptr,
+                                     g_nr.modifiedDiffuseAlbedo, g_nr.modifiedSpecularAlbedo);
+
+                        Barrier(cmdList, g_nr.modifiedDiffuseAlbedo, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                        Barrier(cmdList, g_nr.modifiedSpecularAlbedo, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                        g_nr.modifiedGuidesValid = true;
+                    }
+                }
+
+                // In Solution C, copy resolved NR color into resolveTarget so RR receives enhanced color
+                Barrier(cmdList, g_nr.preEnhancedScratch, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE);
+                Barrier(cmdList, resolveTarget, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COPY_DEST);
+                cmdList->CopyResource(resolveTarget, g_nr.preEnhancedScratch);
+                Barrier(cmdList, resolveTarget, D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                Barrier(cmdList, g_nr.preEnhancedScratch, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+                g_nr.rrStructureValid = false;
+            }
 
             Barrier(cmdList, g_nr.preEnhancedScratch, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
 
-            if (cfg.DlssNrRrSolutionA.value_or_default() && g_nr.rrStructureScratch != nullptr)
+        if (cfg.DlssNrTemporalHistory.value_or_default())
+        {
+            if (g_nr.temporalHistory[0] != nullptr)
             {
-                Barrier(cmdList, g_nr.rrStructureScratch, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                g_nr.rrStructureValid = true;
+                const auto thDesc = g_nr.temporalHistory[0]->GetDesc();
+                if (thDesc.Width != width || thDesc.Height != height || thDesc.Format != desc.Format)
+                {
+                    ParkNrResource(g_nr.temporalHistory[0]);
+                    ParkNrResource(g_nr.temporalHistory[1]);
+                    g_nr.temporalHistoryValid = false;
+                }
             }
-            else
+            if (g_nr.temporalHistory[0] == nullptr)
+                g_nr.temporalHistory[0] = CreateScratch(device, desc.Format, width, height);
+            if (g_nr.temporalHistory[1] == nullptr)
+                g_nr.temporalHistory[1] = CreateScratch(device, desc.Format, width, height);
+
+            if (g_nr.temporalHistory[0] != nullptr && g_nr.temporalHistory[1] != nullptr)
             {
-                g_nr.rrStructureValid = false;
+                const uint32_t currentHistoryIdx = g_nr.temporalHistoryIndex;
+                const uint32_t nextHistoryIdx = 1 - currentHistoryIdx;
+                ID3D12Resource* const historyRead = g_nr.temporalHistory[currentHistoryIdx];
+                ID3D12Resource* const historyWrite = g_nr.temporalHistory[nextHistoryIdx];
+
+                if (!g_nr.temporalHistoryValid || frame.Reset)
+                {
+                    Barrier(cmdList, historyWrite, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            D3D12_RESOURCE_STATE_COPY_DEST);
+                    Barrier(cmdList, resolveTarget, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    cmdList->CopyResource(historyWrite, resolveTarget);
+                    Barrier(cmdList, resolveTarget, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    Barrier(cmdList, historyWrite, D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+                    g_nr.temporalHistoryIndex = nextHistoryIdx;
+                    g_nr.temporalHistoryValid = true;
+                }
+                else
+                {
+                    DlssNrConstants tempParams {};
+                    tempParams.Mode = DlssNrMode_TemporalHistory;
+                    tempParams.Width = width;
+                    tempParams.Height = height;
+                    tempParams.GuideWidth = guideWidth;
+                    tempParams.GuideHeight = guideHeight;
+                    tempParams.MvScaleX = g_nr.guideMvScaleX;
+                    tempParams.MvScaleY = g_nr.guideMvScaleY;
+                    tempParams.JitterDeltaX = (activeMotion == g_nr.dilatedMotion) ? 0.0f : jitterDeltaX;
+                    tempParams.JitterDeltaY = (activeMotion == g_nr.dilatedMotion) ? 0.0f : jitterDeltaY;
+                    tempParams.TemporalHistoryEnabled = 1u;
+                    tempParams.TemporalHistoryWindow = cfg.DlssNrTemporalWindow.value_or_default();
+                    tempParams.TemporalClampSigma = cfg.DlssNrTemporalClampSigma.value_or_default();
+
+                    Barrier(cmdList, resolveTarget, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    Barrier(cmdList, historyWrite, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+                    if (g_nr.preEnhancedScratch == nullptr)
+                        g_nr.preEnhancedScratch = CreateScratch(device, desc.Format, width, height);
+
+                    if (g_nr.preEnhancedScratch != nullptr)
+                    {
+                        DispatchPass(cmdList, tempParams, resolveTarget, historyRead, nullptr, activeMotion,
+                                     nullptr, g_nr.preEnhancedScratch, historyWrite);
+
+                        Barrier(cmdList, historyWrite, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                        Barrier(cmdList, g_nr.preEnhancedScratch, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_COPY_SOURCE);
+                        Barrier(cmdList, resolveTarget, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                D3D12_RESOURCE_STATE_COPY_DEST);
+
+                        cmdList->CopyResource(resolveTarget, g_nr.preEnhancedScratch);
+
+                        Barrier(cmdList, resolveTarget, D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                        Barrier(cmdList, g_nr.preEnhancedScratch, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+                        g_nr.temporalHistoryIndex = nextHistoryIdx;
+                        g_nr.temporalHistoryValid = true;
+                    }
+                }
             }
         }
 
@@ -3272,6 +3505,10 @@ void EvaluateInternal(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* p
     frame.BeforeUpscale = beforeUpscale;
     frame.RayReconstruction = rayReconstruction;
     frame.SubmissionEpoch = timingQueue != nullptr ? submissionEpoch : State::Instance().frameCount;
+
+    // Solution C: Ray Reconstruction guide buffers
+    frame.DiffuseAlbedo = GetResource(params, NVSDK_NGX_Parameter_DiffuseAlbedo, NVSDK_NGX_Parameter_GBuffer_Albedo);
+    frame.SpecularAlbedo = GetResource(params, NVSDK_NGX_Parameter_SpecularAlbedo, NVSDK_NGX_Parameter_GBuffer_SpecularAlbedo);
 
     float jitterX = 0.0f, jitterY = 0.0f;
     if (params->Get(NVSDK_NGX_Parameter_Jitter_Offset_X, &jitterX) == NVSDK_NGX_Result_Success &&
@@ -3816,6 +4053,29 @@ void Shutdown()
     }
     g_nr.rrStructureValid = false;
 
+    for (int i = 0; i < 2; ++i)
+    {
+        if (g_nr.temporalHistory[i] != nullptr)
+        {
+            g_nr.temporalHistory[i]->Release();
+            g_nr.temporalHistory[i] = nullptr;
+        }
+    }
+    g_nr.temporalHistoryValid = false;
+    g_nr.temporalHistoryIndex = 0;
+
+    if (g_nr.modifiedDiffuseAlbedo != nullptr)
+    {
+        g_nr.modifiedDiffuseAlbedo->Release();
+        g_nr.modifiedDiffuseAlbedo = nullptr;
+    }
+    if (g_nr.modifiedSpecularAlbedo != nullptr)
+    {
+        g_nr.modifiedSpecularAlbedo->Release();
+        g_nr.modifiedSpecularAlbedo = nullptr;
+    }
+    g_nr.modifiedGuidesValid = false;
+
     g_capture.release();
     g_gpuTime.reset();
     g_ngxTime.reset();
@@ -3823,5 +4083,26 @@ void Shutdown()
     g_lastGpuTime.reset();
 
     g_compose.reset();
+}
+
+bool HasModifiedGuides()
+{
+    std::lock_guard<std::recursive_mutex> nrLock(g_nrMutex);
+    return Config::Instance()->DlssNrRrSolutionC.value_or_default() &&
+           g_nr.modifiedGuidesValid &&
+           g_nr.modifiedDiffuseAlbedo != nullptr &&
+           g_nr.modifiedSpecularAlbedo != nullptr;
+}
+
+ID3D12Resource* GetModifiedDiffuseAlbedo()
+{
+    std::lock_guard<std::recursive_mutex> nrLock(g_nrMutex);
+    return g_nr.modifiedDiffuseAlbedo;
+}
+
+ID3D12Resource* GetModifiedSpecularAlbedo()
+{
+    std::lock_guard<std::recursive_mutex> nrLock(g_nrMutex);
+    return g_nr.modifiedSpecularAlbedo;
 }
 } // namespace DlssNr

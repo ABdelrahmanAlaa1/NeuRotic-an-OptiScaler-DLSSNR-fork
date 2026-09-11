@@ -158,7 +158,8 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
             return ((IDXGISwapChain1*) pSwapChain)->Present1(SyncInterval, Flags, pPresentParameters);
     }
 
-    LOG_DEBUG("{}", _frameCounter);
+    const bool logThisFrame = (_frameCounter % 300 == 0);
+    if (logThisFrame) LOG_DEBUG("{}", _frameCounter);
 
     HRESULT presentResult;
 
@@ -179,7 +180,7 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
         if (State::Instance().currentFG == nullptr)
             State::Instance().lastFGFrameTime = ftDelta;
 
-        LOG_DEBUG("SyncInterval: {}, Flags: {:X}, Frametime: {:0.3f} ms", SyncInterval, Flags, ftDelta);
+        if (logThisFrame) LOG_DEBUG("SyncInterval: {}, Flags: {:X}, Frametime: {:0.3f} ms", SyncInterval, Flags, ftDelta);
 
         // Update swapchain info evey frame
         if (pSwapChain->GetDesc(&State::Instance().currentSwapchainDesc) != S_OK)
@@ -295,7 +296,7 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     // Fallback when FGPresent is not hooked for V-sync
     if (willPresent && Config::Instance()->ForceVsync.has_value())
     {
-        LOG_DEBUG("ForceVsync: {}, VsyncInterval: {}, SCAllowTearing: {}, realExclusiveFullscreen: {}",
+        if (logThisFrame) LOG_DEBUG("ForceVsync: {}, VsyncInterval: {}, SCAllowTearing: {}, realExclusiveFullscreen: {}",
                   Config::Instance()->ForceVsync.value(), Config::Instance()->VsyncInterval.value_or_default(),
                   State::Instance().SCAllowTearing, State::Instance().realExclusiveFullscreen);
 
@@ -305,7 +306,7 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
 
             if (State::Instance().SCAllowTearing && !State::Instance().realExclusiveFullscreen)
             {
-                LOG_DEBUG("Adding DXGI_PRESENT_ALLOW_TEARING");
+                if (logThisFrame) LOG_DEBUG("Adding DXGI_PRESENT_ALLOW_TEARING");
                 Flags |= DXGI_PRESENT_ALLOW_TEARING;
             }
         }
@@ -321,7 +322,7 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
             Flags &= ~DXGI_PRESENT_ALLOW_TEARING;
         }
 
-        LOG_DEBUG("Final SyncInterval: {}", SyncInterval);
+        if (logThisFrame) LOG_DEBUG("Final SyncInterval: {}", SyncInterval);
     }
 
     // DXVK check, it's here because of upscaler time calculations
@@ -342,7 +343,7 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
                 State::Instance().frameCount = _frameCounter;
             }
 
-            LOG_TRACE("3 {}", (UINT) presentResult);
+            if (logThisFrame) LOG_TRACE("3 {}", (UINT) presentResult);
         }
         else if (presentResult == DXGI_ERROR_DEVICE_REMOVED)
         {
@@ -404,7 +405,7 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
         State::Instance().frameCount = _frameCounter;
     }
 
-    LOG_DEBUG("Calling original present");
+    if (logThisFrame) LOG_DEBUG("Calling original present");
 
     // swapchain present
     if (pPresentParameters == nullptr)
@@ -414,7 +415,7 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
 
     if (presentResult == S_OK)
     {
-        LOG_DEBUG("Original present result: {:X}", (UINT) presentResult);
+        if (logThisFrame) LOG_DEBUG("Original present result: {:X}", (UINT) presentResult);
     }
     else
     {

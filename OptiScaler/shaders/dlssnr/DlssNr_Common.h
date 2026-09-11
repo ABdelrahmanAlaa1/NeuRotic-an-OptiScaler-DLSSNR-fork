@@ -31,7 +31,10 @@ enum DlssNrMode : uint32_t
     DlssNrMode_DilateMotion = 12, // 3x3 depth-based foreground MV dilation + camera jitter compensation
     DlssNrMode_ControlMask = 13, // depth disocclusion + fast motion whip-pan reactive control mask
     DlssNrMode_RrDecompose = 14, // pre-RR tone extraction (Solution A) or pre-multiplier (Solution B)
-    DlssNrMode_RrInject = 15 // post-RR composite injection of high-frequency structure delta
+    DlssNrMode_RrInject = 15, // post-RR composite injection of high-frequency structure delta
+    DlssNrMode_TemporalHistory = 16, // multi-frame YCoCg variance clamping history pass
+    DlssNrMode_RrLumaBlend = 17, // Solution B: post-model luma-only gradient blend
+    DlssNrMode_RrAlbedoBlend = 18 // Solution C: albedo ratio modulation into guide scratch textures
 };
 
 // A successful sample may be reused only on the immediately following frame.
@@ -151,6 +154,10 @@ struct DlssNrFrameInfo
     float JitterOffsetX = 0.0f;
     float JitterOffsetY = 0.0f;
     bool HasJitter = false;
+
+    // Solution C guide buffers
+    void* DiffuseAlbedo = nullptr;
+    void* SpecularAlbedo = nullptr;
 };
 
 struct alignas(256) DlssNrConstants
@@ -249,6 +256,16 @@ struct alignas(256) DlssNrConstants
     uint32_t RrMode;
     uint32_t MotionAdaptiveGuard;
     float MotionClampingThreshold;
+
+    uint32_t TemporalHistoryEnabled;
+    uint32_t TemporalHistoryWindow;
+    float TemporalClampSigma;
+    float VarianceThreshold;
+    float SolCAlbedoBlend;
+    float SolCSpecularBoost;
+    uint32_t SolCUseTransparencyGuide;
+    float Pad0;
+    float Pad1;
 };
 
 class DlssNr_Common

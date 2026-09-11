@@ -7,6 +7,14 @@
 class DLSSDFeatureDx12 : public DLSSDFeature, public IFeature_Dx12
 {
   private:
+    ID3D12Resource* _responsivityMaskBuffer = nullptr;
+    ID3D12Resource* _responsivityUploadBuffer = nullptr;
+    unsigned int _responsivityWidth = 0;
+    unsigned int _responsivityHeight = 0;
+    float _lastResponsivityValue = -999.0f;
+
+    void ReleaseResponsivityResources();
+
   protected:
     bool InitDLSSD(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters);
 

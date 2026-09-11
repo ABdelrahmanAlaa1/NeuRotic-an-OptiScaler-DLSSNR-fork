@@ -277,6 +277,20 @@ class Config
     CustomOptional<bool> DlssNrRrSolutionA { true };
     CustomOptional<bool> DlssNrRrSolutionB { false };
     CustomOptional<float> DlssNrRrStructureBoost { 1.5f };
+    // Solution C: RR guide buffer hijacking — modify albedo/specular to encode NR changes
+    CustomOptional<bool> DlssNrRrSolutionC { false };
+    CustomOptional<float> DlssNrSolCAlbedoBlend { 0.5f };
+    CustomOptional<float> DlssNrSolCSpecularBoost { 0.5f };
+    CustomOptional<bool> DlssNrSolCUseTransparencyGuide { true };
+    // Solution B variance threshold for gradient mask
+    CustomOptional<float> DlssNrSolBVarianceThreshold { 0.01f };
+    // Temporal History: multi-frame variance clamping to reduce temporal boiling
+    CustomOptional<bool> DlssNrTemporalHistory { false };
+    CustomOptional<uint32_t> DlssNrTemporalWindow { 2 };
+    CustomOptional<float> DlssNrTemporalClampSigma { 1.0f };
+    // Responsivity Mask: standalone RR anti-ghosting (Preset F only)
+    CustomOptional<bool> DLSSDRRResponsivityMaskEnabled { false };
+    CustomOptional<float> DLSSDRRResponsivityMaskValue { 0.0f };
     // Toggles the pass in game. Unbound by default -- a key that does something unexpected is worse
     // than one that does nothing.
     CustomOptional<int> DlssNrToggleKey { UnboundKey };

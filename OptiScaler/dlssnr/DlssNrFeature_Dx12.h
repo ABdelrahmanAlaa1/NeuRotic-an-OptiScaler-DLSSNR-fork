@@ -132,5 +132,10 @@ std::optional<double> LastGpuTime();
 void RequestCapture(unsigned int frames);
 bool CaptureInProgress();
 
+// Solution C: Guide buffer hijacking for Ray Reconstruction
+bool HasModifiedGuides();
+ID3D12Resource* GetModifiedDiffuseAlbedo();
+ID3D12Resource* GetModifiedSpecularAlbedo();
+
 void Shutdown();
 } // namespace DlssNr

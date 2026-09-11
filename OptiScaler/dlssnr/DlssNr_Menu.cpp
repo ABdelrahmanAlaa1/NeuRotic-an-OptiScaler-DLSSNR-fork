@@ -205,24 +205,103 @@ void RenderMenu(Config* config, float menuResScale)
         if (ImGui::Checkbox("Solution A: Hybrid Pre-Tone + Post-Structure Injection", &rrSolA))
         {
             config->DlssNrRrSolutionA = rrSolA;
-            if (rrSolA) config->DlssNrRrSolutionB = false;
+            if (rrSolA)
+            {
+                config->DlssNrRrSolutionB = false;
+                config->DlssNrRrSolutionC = false;
+            }
         }
         HelpMarker("Runs NR before RR to inject low-frequency tone that survives RR denoising, then composites high-frequency material/SSR/AO structure after RR.\nFixes material detail and reflections getting filtered out by Ray Reconstruction. Refresh upscaler or menu apply.");
 
         bool rrSolB = config->DlssNrRrSolutionB.value_or_default();
-        if (ImGui::Checkbox("Solution B: Pre-RR Structure Multiplier", &rrSolB))
+        if (ImGui::Checkbox("Solution B: Post-RR Luma-Only Gradient Blend", &rrSolB))
         {
             config->DlssNrRrSolutionB = rrSolB;
-            if (rrSolB) config->DlssNrRrSolutionA = false;
+            if (rrSolB)
+            {
+                config->DlssNrRrSolutionA = false;
+                config->DlssNrRrSolutionC = false;
+            }
         }
-        HelpMarker("Amplifies high-frequency material delta before RR evaluate so it punches through RR's noise rejection threshold.\nAlternative approach to preserve reflections and micro-AO. Refresh upscaler or menu apply.");
+        HelpMarker("Blends high-frequency luminance detail post-model based on a 3x3 variance mask without touching chroma.\nPreserves reflections and micro-AO without model destabilization. Live toggle.");
+
+        if (rrSolB)
+        {
+            float vThresh = config->DlssNrSolBVarianceThreshold.value_or_default();
+            if (ImGui::SliderFloat("Solution B Variance Threshold", &vThresh, 0.001f, 0.1f, "%.3f"))
+                config->DlssNrSolBVarianceThreshold = vThresh;
+            HelpMarker("Threshold for 3x3 luminance variance mask. Higher values restrict blending to sharper high-contrast edges.");
+        }
+
+        bool rrSolC = config->DlssNrRrSolutionC.value_or_default();
+        if (ImGui::Checkbox("Solution C: RR Guide Buffer Hijacking", &rrSolC))
+        {
+            config->DlssNrRrSolutionC = rrSolC;
+            if (rrSolC)
+            {
+                config->DlssNrRrSolutionA = false;
+                config->DlssNrRrSolutionB = false;
+            }
+        }
+        HelpMarker("Experimental: modifies copies of the game's diffuse and specular albedo guide buffers so Ray Reconstruction treats NR added materials/SSR/AO as intended scene signal rather than noise.");
+
+        if (rrSolC)
+        {
+            float albBlend = config->DlssNrSolCAlbedoBlend.value_or_default();
+            if (ImGui::SliderFloat("Albedo Blend Strength", &albBlend, 0.0f, 1.0f, "%.2f"))
+                config->DlssNrSolCAlbedoBlend = albBlend;
+            HelpMarker("Strength of NR color ratio modulation applied to diffuse albedo guide buffer.");
+
+            float specBoost = config->DlssNrSolCSpecularBoost.value_or_default();
+            if (ImGui::SliderFloat("Specular Boost Multiplier", &specBoost, 0.0f, 2.0f, "%.2fx"))
+                config->DlssNrSolCSpecularBoost = specBoost;
+            HelpMarker("Multiplier for boosting specular albedo guide buffer based on NR high-frequency delta.");
+
+            bool transGuide = config->DlssNrSolCUseTransparencyGuide.value_or_default();
+            if (ImGui::Checkbox("Use ColorBeforeTransparency Guide", &transGuide))
+                config->DlssNrSolCUseTransparencyGuide = transGuide;
+            HelpMarker("Feeds pre-NR color into DLSSD.ColorBeforeTransparency so Ray Reconstruction treats NR additions as a transparency layer to upscale rather than denoise.");
+        }
 
         if (rrSolA || rrSolB)
         {
             float boost = config->DlssNrRrStructureBoost.value_or_default();
-            if (ImGui::SliderFloat("RR Structure Boost", &boost, 0.0f, 5.0f, "%.2fx"))
+            if (ImGui::SliderFloat("RR Structure Boost", &boost, 0.0f, 2.0f, "%.2fx"))
                 config->DlssNrRrStructureBoost = boost;
             HelpMarker("Multiplier for high-frequency structure, specular glints, SSR and micro-AO detail in Ray Reconstruction.\nDefault: 1.50x. Live toggle.");
+        }
+
+        ImGui::SeparatorText("Ray Reconstruction Responsivity Mask (Feature Request A)");
+        bool respMask = config->DLSSDRRResponsivityMaskEnabled.value_or_default();
+        if (ImGui::Checkbox("Enable RR Responsivity Mask", &respMask))
+            config->DLSSDRRResponsivityMaskEnabled = respMask;
+        HelpMarker("Injects a constant responsivity mask [-1.0, 1.0] to Ray Reconstruction to control temporal accumulation responsiveness.\nNote: Only supported with DLSS-D Preset F!");
+
+        if (respMask)
+        {
+            float respVal = config->DLSSDRRResponsivityMaskValue.value_or_default();
+            if (ImGui::SliderFloat("Responsivity Mask Value", &respVal, -1.0f, 1.0f, "%.2f"))
+                config->DLSSDRRResponsivityMaskValue = respVal;
+            HelpMarker("Negative values increase temporal stability; positive values increase responsiveness to fast-changing lighting.\nPreset F only.");
+        }
+
+        ImGui::SeparatorText("Temporal History (Anti-Boiling)");
+        bool tempHist = config->DlssNrTemporalHistory.value_or_default();
+        if (ImGui::Checkbox("Enable Temporal History", &tempHist))
+            config->DlssNrTemporalHistory = tempHist;
+        HelpMarker("Multi-frame YCoCg variance clamping to eliminate temporal boiling and shimmer across frames without ghosting.");
+
+        if (tempHist)
+        {
+            int tWin = (int)config->DlssNrTemporalWindow.value_or_default();
+            if (ImGui::SliderInt("History Window (Frames)", &tWin, 1, 4))
+                config->DlssNrTemporalWindow = (uint32_t)tWin;
+            HelpMarker("Number of previous frames to maintain in temporal history clamp buffer.");
+
+            float tSigma = config->DlssNrTemporalClampSigma.value_or_default();
+            if (ImGui::SliderFloat("Variance Clamp Sigma", &tSigma, 0.5f, 2.0f, "%.2f"))
+                config->DlssNrTemporalClampSigma = tSigma;
+            HelpMarker("Variance bounding multiplier for color clamping. Lower values clamp harder (less boiling, slight ghosting risk); higher values allow more temporal variance.");
         }
 
         // Either backend. The two keep separate state, and on a native Vulkan game the D3D12 side
@@ -1096,13 +1175,21 @@ void RenderMenu(Config* config, float menuResScale)
             HelpMarker("Position of the comparison boundary. Swap sides reverses which image appears on each side.");
         }
 
-        static const char* debugNames[] = { "Off", "Proxy (what the model sees)", "Model output (raw)",
-                                            "Difference (amplified)" };
+        static const char* debugNames[] = {
+            "Off",
+            "Proxy (what the model sees)",
+            "Model output (raw)",
+            "Difference (amplified)",
+            "Motion vectors",
+            "Control / Disocclusion mask",
+            "Camera jitter delta",
+            "RR structure delta"
+        };
         int debugView = (int) config->DlssNrDebugView.value_or_default();
         if (ImGui::Combo("Debug view", &debugView, debugNames, IM_ARRAYSIZE(debugNames)))
             config->DlssNrDebugView = (uint32_t) debugView;
 
-        HelpMarker("Show the model input, raw output, or a 20x amplified difference. Grey in Difference means no change.");
+        HelpMarker("Show the model input, raw output, amplified difference, motion vectors, reactive control mask, subpixel camera jitter delta, or RR structure delta.");
 
         ImGui::PopItemWidth();
     }
